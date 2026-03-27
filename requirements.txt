@@ -1,0 +1,7 @@
+torch
+nvidia-modelopt[torch]
+transformers
+safetensors
+huggingface_hub
+accelerate
+lm-eval

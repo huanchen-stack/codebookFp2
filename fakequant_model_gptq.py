@@ -100,9 +100,9 @@ def _collect_hessians(
         for name, module in layers_in_block:
             hooks.append(module.register_forward_hook(make_hook(name)))
 
-        for i, sample in enumerate(samples):
-            with torch.no_grad():
-                model(sample.to(device))
+        batch = torch.cat(samples, dim=0).to(device)
+        with torch.no_grad():
+            model(batch, use_cache=False)
 
         for h in hooks:
             h.remove()

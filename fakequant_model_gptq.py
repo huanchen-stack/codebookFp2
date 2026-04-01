@@ -65,14 +65,13 @@ def _collect_hessians(
             n = X.shape[0]
             d = X.shape[1]
             if layer_name not in hessians:
-                hessians[layer_name] = torch.zeros(d, d, dtype=torch.float32)
+                hessians[layer_name] = torch.zeros(d, d, device=X.device, dtype=torch.float32)
                 sample_counts[layer_name] = 0
             sc = sample_counts[layer_name]
             beta = sc / (sc + n)
             alpha = 2.0 / (sc + n)
             X_scaled = X.mul(math.sqrt(alpha))
-            update = X_scaled.T @ X_scaled
-            hessians[layer_name].mul_(beta).add_(update.cpu())
+            hessians[layer_name].mul_(beta).addmm_(X_scaled.T, X_scaled)
             sample_counts[layer_name] = sc + n
         return hook_fn
 

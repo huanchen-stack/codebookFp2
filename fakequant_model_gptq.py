@@ -53,43 +53,66 @@ def _collect_hessians(
         samples.append(tokens[i : i + seq_len].unsqueeze(0))
     print(f"  {len(samples)} sequences x {seq_len} tokens")
 
-    hessians: dict[str, torch.Tensor] = {}
-    sample_counts: dict[str, int] = {}
-
-    def make_hook(layer_name: str):
-        def hook_fn(module, inp, out):
-            X = inp[0].detach()
-            if X.dim() == 3:
-                X = X.reshape(-1, X.shape[-1])
-            X = X.float()
-            n = X.shape[0]
-            d = X.shape[1]
-            if layer_name not in hessians:
-                hessians[layer_name] = torch.zeros(d, d, device=X.device, dtype=torch.float32)
-                sample_counts[layer_name] = 0
-            sc = sample_counts[layer_name]
-            beta = sc / (sc + n)
-            alpha = 2.0 / (sc + n)
-            X_scaled = X.mul(math.sqrt(alpha))
-            hessians[layer_name].mul_(beta).addmm_(X_scaled.T, X_scaled)
-            sample_counts[layer_name] = sc + n
-        return hook_fn
-
-    hooks = []
+    block_layers: dict[int, list[tuple[str, torch.nn.Module]]] = {}
     for name, module in model.named_modules():
-        if isinstance(module, torch.nn.Linear):
-            hooks.append(module.register_forward_hook(make_hook(name)))
-    print(f"  Hooked {len(hooks)} linear layers")
+        if not isinstance(module, torch.nn.Linear):
+            continue
+        parts = name.split(".")
+        block_idx = None
+        for j, p in enumerate(parts):
+            if p == "layers" and j + 1 < len(parts) and parts[j + 1].isdigit():
+                block_idx = int(parts[j + 1])
+                break
+        if block_idx is not None:
+            block_layers.setdefault(block_idx, []).append((name, module))
 
+    num_blocks = len(block_layers)
+    print(f"  {num_blocks} transformer blocks, processing one at a time")
+
+    hessians: dict[str, torch.Tensor] = {}
     device = next(model.parameters()).device
-    for i, sample in enumerate(samples):
-        with torch.no_grad():
-            model(sample.to(device))
-        if (i + 1) % 16 == 0 or i == len(samples) - 1:
-            print(f"  [{i + 1}/{len(samples)}] calibration samples processed")
 
-    for h in hooks:
-        h.remove()
+    for block_idx in sorted(block_layers.keys()):
+        layers_in_block = block_layers[block_idx]
+        block_hessians: dict[str, torch.Tensor] = {}
+        block_counts: dict[str, int] = {}
+
+        def make_hook(layer_name: str):
+            def hook_fn(module, inp, out):
+                X = inp[0].detach()
+                if X.dim() == 3:
+                    X = X.reshape(-1, X.shape[-1])
+                X = X.float()
+                n = X.shape[0]
+                d = X.shape[1]
+                if layer_name not in block_hessians:
+                    block_hessians[layer_name] = torch.zeros(d, d, device=X.device, dtype=torch.float32)
+                    block_counts[layer_name] = 0
+                sc = block_counts[layer_name]
+                beta = sc / (sc + n)
+                alpha = 2.0 / (sc + n)
+                X_scaled = X.mul(math.sqrt(alpha))
+                block_hessians[layer_name].mul_(beta).addmm_(X_scaled.T, X_scaled)
+                block_counts[layer_name] = sc + n
+            return hook_fn
+
+        hooks = []
+        for name, module in layers_in_block:
+            hooks.append(module.register_forward_hook(make_hook(name)))
+
+        for i, sample in enumerate(samples):
+            with torch.no_grad():
+                model(sample.to(device))
+
+        for h in hooks:
+            h.remove()
+
+        for name, H in block_hessians.items():
+            hessians[name] = H.cpu()
+        del block_hessians
+        torch.cuda.empty_cache()
+
+        print(f"  block {block_idx}/{num_blocks - 1}: {len(layers_in_block)} layers done")
 
     bf16_weights: dict[str, torch.Tensor] = {}
     if collect_weights:
@@ -102,9 +125,7 @@ def _collect_hessians(
     del model
     torch.cuda.empty_cache()
 
-    for name in hessians:
-        hessians[name] = hessians[name].cpu()
-    print(f"  Collected {len(hessians)} Hessians")
+    print(f"  Collected {len(hessians)} Hessians total")
 
     return hessians, bf16_weights
 

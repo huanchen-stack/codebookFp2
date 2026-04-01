@@ -100,9 +100,13 @@ def _collect_hessians(
         for name, module in layers_in_block:
             hooks.append(module.register_forward_hook(make_hook(name)))
 
-        batch = torch.cat(samples, dim=0).to(device)
-        with torch.no_grad():
-            model(batch, use_cache=False)
+        cal_batch_size = 4
+        for b_start in range(0, len(samples), cal_batch_size):
+            batch = torch.cat(samples[b_start:b_start + cal_batch_size], dim=0).to(device)
+            with torch.no_grad():
+                model(batch, use_cache=False)
+            del batch
+            torch.cuda.empty_cache()
 
         for h in hooks:
             h.remove()

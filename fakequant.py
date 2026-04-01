@@ -173,7 +173,7 @@ class CodebookQuantizer:
         new_effective_scale = opt_scale.reshape(out_features, in_features // 16)
         new_weight_scale = self._cast_scale_to_fp8(new_effective_scale * gscale)
 
-        return self.pack_fp4_to_uint8(opt_fp4), new_weight_scale
+        return self.pack_fp4_to_uint8(opt_fp4), new_weight_scale.to(dtype=weight_scale.dtype)
 
     def fakequant_blocks(self, fp4_values, return_mse: bool = False):
         if fp4_values.dim() != 2 or fp4_values.shape[1] != 16:

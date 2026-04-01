@@ -112,7 +112,7 @@ def _process_shards(
     quantizer: CodebookQuantizer,
     device: torch.device,
     dry_run: bool,
-    optimize_scales: bool = False,
+    vanilla: bool = False,
 ) -> None:
     shard_order: list[str] = []
     seen: set[str] = set()
@@ -172,10 +172,17 @@ def _process_shards(
                     input_path, weight_map[gscale_name], gscale_name
                 )
 
-            mode = "fakequant+scale" if optimize_scales else "fakequant"
+            mode = "fakequant" if vanilla else "fakequant+scale"
             print(f"  [{idx}/{len(target_layers)}] {mode} {base}")
 
-            if optimize_scales:
+            if vanilla:
+                quantized_packed = quantizer._fakequant_layer_vanilla(
+                    packed_cpu.to(device=device),
+                    scale_cpu.to(device=device),
+                    gscale_cpu.to(device=device),
+                )
+                tensors[weight_name] = quantized_packed.to(device="cpu")
+            else:
                 quantized_packed, new_scale = quantizer.fakequant_layer(
                     packed_cpu.to(device=device),
                     scale_cpu.to(device=device),
@@ -183,20 +190,13 @@ def _process_shards(
                 )
                 tensors[weight_name] = quantized_packed.to(device="cpu")
                 tensors[scale_name] = new_scale.to(device="cpu")
-            else:
-                quantized_packed = quantizer._fakequant_layer_vanilla(
-                    packed_cpu.to(device=device),
-                    scale_cpu.to(device=device),
-                    gscale_cpu.to(device=device),
-                )
-                tensors[weight_name] = quantized_packed.to(device="cpu")
 
         if not dry_run:
             save_file(tensors, str(output_shard))
             print(f"[{shard_idx}/{len(shard_order)}] Saved: {shard_rel}")
 
 
-def run(input_path: Path, output_path: Path, device: str, mlp_only: bool, dry_run: bool, optimize_scales: bool = False) -> None:
+def run(input_path: Path, output_path: Path, device: str, mlp_only: bool, dry_run: bool, vanilla: bool = False) -> None:
     if not input_path.exists() or not input_path.is_dir():
         raise FileNotFoundError(f"Input path does not exist or is not a directory: {input_path}")
 
@@ -235,7 +235,7 @@ def run(input_path: Path, output_path: Path, device: str, mlp_only: bool, dry_ru
         quantizer=quantizer,
         device=resolved_device,
         dry_run=False,
-        optimize_scales=optimize_scales,
+        vanilla=vanilla,
     )
 
     elapsed = time.perf_counter() - start_time
@@ -255,8 +255,8 @@ def main() -> None:
                         help="Only quantize MLP layers (gate/up/down_proj + MoE experts), skip attention")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print target layer names and shapes without quantizing")
-    parser.add_argument("--optimize-scales", action="store_true",
-                        help="Jointly optimize codebook entry and per-block FP8 scale factor")
+    parser.add_argument("--vanilla", action="store_true",
+                        help="Use vanilla codebook selection without scale optimization")
     args = parser.parse_args()
 
     run(
@@ -265,7 +265,7 @@ def main() -> None:
         device=args.device,
         mlp_only=args.mlp_only,
         dry_run=args.dry_run,
-        optimize_scales=args.optimize_scales,
+        vanilla=args.vanilla,
     )
 
 

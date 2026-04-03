@@ -84,9 +84,8 @@ print(f"  codebook MSE:     {codebook_mse:.6f}")
 print(f"  unique codebook:  {sorted(set(codebook_fp4[0].tolist()))}")
 print(f"  MSE increase:     {codebook_mse / nvfp4_mse:.2f}x")
 
-max_iters = 5
-print(f"\n=== Scale optimization: single block (max_iters={max_iters}) ===")
-opt_fp4, opt_scale = q.fakequant_blocks_with_scale(bf16_block.float(), max_iters=max_iters)
+print(f"\n=== Scale optimization: single block ===")
+opt_fp4, opt_scale = q.fakequant_blocks_with_scale(bf16_block.float())
 opt_dequant = opt_fp4 * opt_scale
 opt_mse = ((bf16_block.float() - opt_dequant) ** 2).mean().item()
 
@@ -96,7 +95,7 @@ print(f"  joint-opt dequant:{[f'{v:.4f}' for v in opt_dequant[0].tolist()]}")
 print(f"  joint-opt MSE:    {opt_mse:.6f}")
 print(f"  vs fixed codebook: {(1 - opt_mse / codebook_mse) * 100:.1f}% MSE reduction")
 
-print(f"\n=== Scale optimization: 1024 random blocks (max_iters={max_iters}) ===")
+print(f"\n=== Scale optimization: 1024 random blocks ===")
 torch.manual_seed(123)
 num_test_blocks = 1024
 test_weights = torch.randn(num_test_blocks, 16)
@@ -112,7 +111,7 @@ codebook_fp4_test = q.fakequant_blocks(fp4_test)
 fixed_dequant_test = codebook_fp4_test * scale_test
 fixed_mse_per = ((test_weights - fixed_dequant_test) ** 2).mean(dim=-1)
 
-opt_fp4_test, opt_scale_test = q.fakequant_blocks_with_scale(test_weights, max_iters=max_iters)
+opt_fp4_test, opt_scale_test = q.fakequant_blocks_with_scale(test_weights)
 opt_dequant_test = opt_fp4_test * opt_scale_test
 opt_mse_per = ((test_weights - opt_dequant_test) ** 2).mean(dim=-1)
 
@@ -126,6 +125,50 @@ print(f"  avg fixed-scale codebook: {avg_fixed:.6f}  ({avg_fixed / avg_nvfp4:.2f
 print(f"  avg joint-opt codebook:   {avg_opt:.6f}  ({avg_opt / avg_nvfp4:.2f}x vs NVFP4)")
 print(f"  MSE reduction:            {(1 - avg_opt / avg_fixed) * 100:.1f}%")
 print(f"  blocks improved:          {blocks_improved}/{num_test_blocks}")
+
+print(f"\n=== Scale-opt codebook change analysis (10000 blocks) ===")
+torch.manual_seed(42)
+NUM_ANALYSIS = 10000
+w_an = torch.randn(NUM_ANALYSIS, 16)
+fp4_vals = q.fp4_representable
+value_table = q._value_table
+error_table = q._error_table
+
+amax_an = w_an.abs().amax(dim=-1, keepdim=True)
+s_init_an = q._cast_scale_to_fp8(amax_an / FP4_MAX)
+fp4_idx_an = (w_an / s_init_an).unsqueeze(-1).sub(fp4_vals).abs().argmin(dim=-1)
+
+best_k_fixed = error_table[fp4_idx_an].mean(dim=1).argmin(dim=-1)
+q_fixed_an = value_table[fp4_idx_an, best_k_fixed.unsqueeze(1).expand(-1, 16)]
+
+q_all_an = value_table[fp4_idx_an]
+numer_an = (w_an.unsqueeze(-1) * q_all_an).sum(dim=1)
+denom_an = (q_all_an ** 2).sum(dim=1).clamp(min=1e-10)
+score_an = numer_an.clamp(min=0) ** 2 / denom_an
+best_k_opt = score_an.argmax(dim=-1)
+q_opt_an = q_all_an.gather(2, best_k_opt.view(-1, 1, 1).expand(-1, 16, 1)).squeeze(2)
+s_opt_an = q._cast_scale_to_fp8(
+    numer_an.gather(1, best_k_opt.unsqueeze(1)) / denom_an.gather(1, best_k_opt.unsqueeze(1))
+)
+
+cb_changed = (best_k_opt != best_k_fixed).sum().item()
+mse_fixed_an = ((w_an - q_fixed_an * s_init_an) ** 2).mean(dim=-1)
+mse_opt_an = ((w_an - q_opt_an * s_opt_an) ** 2).mean(dim=-1)
+improved_an = (mse_opt_an < mse_fixed_an).sum().item()
+
+print(f"  codebook changed:  {cb_changed}/{NUM_ANALYSIS} ({100*cb_changed/NUM_ANALYSIS:.1f}%)")
+print(f"  MSE improved:      {improved_an}/{NUM_ANALYSIS} ({100*improved_an/NUM_ANALYSIS:.1f}%)")
+print(f"  avg MSE fixed:     {mse_fixed_an.mean().item():.6f}")
+print(f"  avg MSE opt:       {mse_opt_an.mean().item():.6f}")
+print(f"  reduction:         {(1 - mse_opt_an.mean() / mse_fixed_an.mean()) * 100:.1f}%")
+
+cb_diff = best_k_opt != best_k_fixed
+cb_same = ~cb_diff
+if cb_diff.any() and cb_same.any():
+    print(f"  --- codebook CHANGED ({cb_diff.sum().item()} blocks) ---")
+    print(f"    MSE: {mse_fixed_an[cb_diff].mean().item():.6f} -> {mse_opt_an[cb_diff].mean().item():.6f}  ({(1-mse_opt_an[cb_diff].mean()/mse_fixed_an[cb_diff].mean())*100:.1f}% reduction)")
+    print(f"  --- codebook SAME ({cb_same.sum().item()} blocks) ---")
+    print(f"    MSE: {mse_fixed_an[cb_same].mean().item():.6f} -> {mse_opt_an[cb_same].mean().item():.6f}  ({(1-mse_opt_an[cb_same].mean()/mse_fixed_an[cb_same].mean())*100:.1f}% reduction)")
 
 print("\n=== Scale roundtrip: fakequant_layer dequant invariant ===")
 torch.manual_seed(99)
@@ -188,6 +231,52 @@ print(f"  max distinct values per block: {max_distinct}")
 print(f"  first block orig:  {[f'{v:+.1f}' for v in layer_fp4[0, :16].tolist()]}")
 print(f"  first block quant: {[f'{v:+.1f}' for v in quantized_layer[0, :16].tolist()]}")
 
+print("\n=== fakequant_layer_bf16: single layer ===")
+torch.manual_seed(77)
+bf16_layer = torch.randn(out_f, in_f)
+bf16_out = q.fakequant_layer_bf16(bf16_layer)
+
+assert bf16_out.shape == bf16_layer.shape, f"Shape mismatch: {bf16_out.shape} vs {bf16_layer.shape}"
+assert bf16_out.dtype == bf16_layer.dtype, f"Dtype mismatch: {bf16_out.dtype} vs {bf16_layer.dtype}"
+assert not bf16_out.isnan().any(), "NaN in fakequant_layer_bf16 output"
+
+bf16_blocks = bf16_out.reshape(-1, 16)
+fp4_vals = q.fp4_representable
+for i in range(bf16_blocks.shape[0]):
+    block = bf16_blocks[i]
+    block_scale = block.abs().max()
+    if block_scale < 1e-8:
+        continue
+    normalized = block / block_scale
+    distinct = len(set(normalized.tolist()))
+    assert distinct <= 4, f"BF16 block {i} has {distinct} distinct normalized values (>4)"
+
+bf16_mse = ((bf16_layer - bf16_out) ** 2).mean().item()
+print(f"  shape: {bf16_layer.shape} -> {bf16_out.shape}")
+print(f"  MSE: {bf16_mse:.6f}")
+print(f"  PASS")
+
+print("\n=== fakequant_layer_bf16: bfloat16 dtype preservation ===")
+bf16_layer_bf = bf16_layer.to(torch.bfloat16)
+bf16_out_bf = q.fakequant_layer_bf16(bf16_layer_bf)
+assert bf16_out_bf.dtype == torch.bfloat16, f"Expected bfloat16, got {bf16_out_bf.dtype}"
+print(f"  input dtype: {bf16_layer_bf.dtype}  output dtype: {bf16_out_bf.dtype}")
+print(f"  PASS")
+
+print("\n=== fakequant_layer_bf16: dimension validation ===")
+try:
+    q.fakequant_layer_bf16(torch.randn(16))
+    assert False, "Should have raised ValueError for 1D input"
+except ValueError:
+    print(f"  1D input correctly rejected")
+
+try:
+    q.fakequant_layer_bf16(torch.randn(4, 15))
+    assert False, "Should have raised ValueError for in_features not divisible by 16"
+except ValueError:
+    print(f"  in_features=15 correctly rejected")
+print(f"  PASS")
+
 if args.benchmark:
     import time
     bench_out, bench_in = 2048, 768
@@ -215,7 +304,7 @@ if args.benchmark:
     elapsed_vanilla = time.perf_counter() - t0
     print(f"  {elapsed_vanilla:.2f}s  ({total_blocks} total blocks, {total_blocks / elapsed_vanilla:.0f} blocks/s)")
 
-    print(f"\n=== Benchmark scale-opt (max_iters={max_iters}): {num_tensors} x ({bench_out}x{bench_in}) ===")
+    print(f"\n=== Benchmark scale-opt: {num_tensors} x ({bench_out}x{bench_in}) ===")
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     for p, s, g in layers_d:

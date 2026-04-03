@@ -131,4 +131,84 @@ direct_mse = ((bf16_weights - dequant_d) ** 2).mean().item()
 print(f"  MSE: {direct_mse:.6f}  NaN: False")
 print(f"  PASS")
 
+print("\n=== BF16 input model: fakequant_model.py --output-format bf16 ===")
+with tempfile.TemporaryDirectory() as tmpdir_bf16:
+    bf16_input_dir = Path(tmpdir_bf16) / "bf16_input"
+    bf16_input_dir.mkdir()
+
+    torch.manual_seed(42)
+    bf16_raw = torch.randn(OUT, IN, dtype=torch.bfloat16)
+    layer_base_bf16 = "model.layers.0.mlp.gate_proj"
+    bf16_tensors = {
+        f"{layer_base_bf16}.weight": bf16_raw,
+    }
+    bf16_shard = "model-00001-of-00001.safetensors"
+    save_file(bf16_tensors, str(bf16_input_dir / bf16_shard))
+
+    bf16_index = {
+        "metadata": {},
+        "weight_map": {k: bf16_shard for k in bf16_tensors},
+    }
+    with (bf16_input_dir / "model.safetensors.index.json").open("w") as f:
+        json.dump(bf16_index, f)
+
+    bf16_output_dir = Path(tmpdir_bf16) / "bf16_output"
+    cmd_bf16 = [
+        sys.executable, "fakequant_model.py",
+        "--input-path", str(bf16_input_dir),
+        "--output-path", str(bf16_output_dir),
+        "--device", "cpu",
+        "--output-format", "bf16",
+    ]
+    result_bf16 = subprocess.run(cmd_bf16, capture_output=True, text=True)
+    if result_bf16.returncode != 0:
+        print(f"  FAILED:")
+        print(result_bf16.stderr)
+    else:
+        out_bf16_tensors = load_file(str(bf16_output_dir / bf16_shard))
+        out_bf16_w = out_bf16_tensors[f"{layer_base_bf16}.weight"]
+
+        assert out_bf16_w.shape == bf16_raw.shape, f"Shape mismatch: {out_bf16_w.shape} vs {bf16_raw.shape}"
+        assert f"{layer_base_bf16}.weight_scale" not in out_bf16_tensors, "BF16 output should not have weight_scale"
+        assert not out_bf16_w.isnan().any(), "NaN in BF16 output"
+
+        bf16_mse = ((bf16_raw.float() - out_bf16_w.float()) ** 2).mean().item()
+        print(f"  output dtype={out_bf16_w.dtype}  shape={out_bf16_w.shape}")
+        print(f"  MSE vs original: {bf16_mse:.6f}")
+        print(f"  PASS")
+
+    print("\n=== BF16 input model: fakequant_model.py --output-format nvfp4 ===")
+    nvfp4_output_dir = Path(tmpdir_bf16) / "nvfp4_output"
+    cmd_nvfp4 = [
+        sys.executable, "fakequant_model.py",
+        "--input-path", str(bf16_input_dir),
+        "--output-path", str(nvfp4_output_dir),
+        "--device", "cpu",
+        "--output-format", "nvfp4",
+    ]
+    result_nvfp4 = subprocess.run(cmd_nvfp4, capture_output=True, text=True)
+    if result_nvfp4.returncode != 0:
+        print(f"  FAILED:")
+        print(result_nvfp4.stderr)
+    else:
+        out_nvfp4_tensors = load_file(str(nvfp4_output_dir / bf16_shard))
+        out_nvfp4_packed = out_nvfp4_tensors[f"{layer_base_bf16}.weight"]
+        out_nvfp4_scale = out_nvfp4_tensors[f"{layer_base_bf16}.weight_scale"]
+        out_nvfp4_gs = out_nvfp4_tensors[f"{layer_base_bf16}.weight_scale_2"]
+
+        assert out_nvfp4_packed.dtype == torch.uint8, f"Expected uint8 packed, got {out_nvfp4_packed.dtype}"
+        assert out_nvfp4_packed.shape == (OUT, IN // 2), f"Packed shape mismatch: {out_nvfp4_packed.shape}"
+
+        out_fp4 = q.unpack_uint8_to_fp4(out_nvfp4_packed)
+        out_eff = out_nvfp4_scale.to(torch.float32) * out_nvfp4_gs.to(torch.float32)
+        out_eff_exp = out_eff.repeat_interleave(16, dim=1)
+        dequant_nvfp4_from_bf16 = out_fp4 * out_eff_exp
+        nvfp4_from_bf16_mse = ((bf16_raw.float() - dequant_nvfp4_from_bf16) ** 2).mean().item()
+
+        assert not dequant_nvfp4_from_bf16.isnan().any(), "NaN in nvfp4-from-bf16 dequant"
+        print(f"  packed dtype={out_nvfp4_packed.dtype}  shape={out_nvfp4_packed.shape}")
+        print(f"  scale  dtype={out_nvfp4_scale.dtype}  shape={out_nvfp4_scale.shape}")
+        print(f"  MSE vs original: {nvfp4_from_bf16_mse:.6f}")
+        print(f"  PASS")
+
 print("\nAll test_fakequant_model.py tests passed.")

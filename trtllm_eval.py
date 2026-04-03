@@ -13,8 +13,8 @@ from tensorrt_llm.evaluate import (  # pyright: ignore[reportMissingImports]
     GPQADiamond,
     GPQAExtended,
     GPQAMain,
-    LongBenchV1,
-    LongBenchV2,
+    # LongBenchV1,
+    # LongBenchV2,
     MMLU,
     MMMU,
     CnnDailymail,
@@ -61,17 +61,17 @@ TASK_REGISTRY: dict[str, dict[str, Any]] = {
         "default_max_tokens": 512,
         "evaluator_kwargs": {"is_multimodal": True, "apply_chat_template": True},
     },
-    # ---- long context (slow) ----------------------------------------------
-    "longbench_v1": {
-        "evaluator_cls": LongBenchV1,
-        "display_name": "LongBench V1",
-        "default_max_tokens": 512,
-    },
-    "longbench_v2": {
-        "evaluator_cls": LongBenchV2,
-        "display_name": "LongBench V2",
-        "default_max_tokens": 512,
-    },
+    # # ---- long context (slow) ----------------------------------------------
+    # "longbench_v1": {
+    #     "evaluator_cls": LongBenchV1,
+    #     "display_name": "LongBench V1",
+    #     "default_max_tokens": 512,
+    # },
+    # "longbench_v2": {
+    #     "evaluator_cls": LongBenchV2,
+    #     "display_name": "LongBench V2",
+    #     "default_max_tokens": 512,
+    # },
     # ---- generation quality -----------------------------------------------
     "cnn_dailymail": {
         "evaluator_cls": CnnDailymail,
@@ -88,7 +88,7 @@ TASK_REGISTRY: dict[str, dict[str, Any]] = {
 DEFAULT_TASKS = ["mmlu"]
 
 DEFAULT_MODELS = [
-    "models/Qwen3-30B-A3B-NVFP4",
+    # "models/Qwen3-30B-A3B-NVFP4",
     "models/Qwen3-30B-A3B-NVFP4-CBINT2",
 ]
 

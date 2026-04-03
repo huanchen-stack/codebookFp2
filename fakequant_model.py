@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import time
 from pathlib import Path
@@ -16,6 +17,39 @@ from fakequant import CodebookQuantizer
 
 MLP_SUFFIXES = (".mlp.gate_proj", ".mlp.up_proj", ".mlp.down_proj")
 EXPERT_MLP_PATTERN = ".mlp.experts."
+
+CBINT2_COMPUTE_CAP_ENV = "CBINT2_COMPUTE_CAP"
+MIN_SM_FOR_FP4 = (8, 9)
+
+
+def detect_output_format() -> str:
+    env_val = os.environ.get(CBINT2_COMPUTE_CAP_ENV)
+    if env_val is not None:
+        parts = env_val.strip().split(".")
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            cc = (int(parts[0]), int(parts[1]))
+        elif len(parts) == 1 and parts[0].isdigit():
+            major = int(parts[0])
+            cc = (major, 0)
+        else:
+            raise ValueError(
+                f"Invalid {CBINT2_COMPUTE_CAP_ENV}='{env_val}'. "
+                "Expected format: '8.0' or '8.9' or '10'"
+            )
+        return "nvfp4" if cc >= MIN_SM_FOR_FP4 else "bf16"
+
+    if torch.cuda.is_available():
+        cc = torch.cuda.get_device_capability()
+        return "nvfp4" if cc >= MIN_SM_FOR_FP4 else "bf16"
+
+    return "bf16"
+
+
+def detect_input_format(weight_map: dict[str, str]) -> str:
+    for name in weight_map:
+        if name.endswith(".weight_scale"):
+            return "nvfp4"
+    return "bf16"
 
 
 def _default_device() -> str:
@@ -52,6 +86,20 @@ def _find_quantized_layers(weight_map: dict[str, str]) -> list[str]:
         gscale_alt = f"{base}.weight_scale_2"
         if scale in weight_map and (gscale_packed in weight_map or gscale_alt in weight_map):
             bases.append(base)
+    return bases
+
+
+def _find_bf16_layers(weight_map: dict[str, str]) -> list[str]:
+    bases = []
+    for name in sorted(weight_map):
+        if not name.endswith(".weight"):
+            continue
+        base = name[: -len(".weight")]
+        scale = f"{base}.weight_scale"
+        if scale not in weight_map:
+            parts = base.split(".")
+            if any(p == "layers" for p in parts):
+                bases.append(base)
     return bases
 
 
@@ -113,6 +161,8 @@ def _process_shards(
     device: torch.device,
     dry_run: bool,
     vanilla: bool = False,
+    input_format: str = "nvfp4",
+    output_format: str = "nvfp4",
 ) -> None:
     shard_order: list[str] = []
     seen: set[str] = set()
@@ -121,10 +171,10 @@ def _process_shards(
             seen.add(shard)
             shard_order.append(shard)
 
-    target_weight_names = {_resolve_weight_name(b, weight_map) for b in target_layers}
     layer_to_idx = {b: idx + 1 for idx, b in enumerate(target_layers)}
 
     print(f"Target layers: {len(target_layers)} across {len(shard_order)} shard(s).")
+    print(f"Input format: {input_format}  Output format: {output_format}")
     if not dry_run:
         print(f"Using device: {device}")
 
@@ -148,9 +198,6 @@ def _process_shards(
 
         for base in shard_targets:
             weight_name = _resolve_weight_name(base, weight_map)
-            scale_name = f"{base}.weight_scale"
-            gscale_name = _resolve_gscale_name(base, weight_map)
-
             idx = layer_to_idx[base]
 
             if dry_run:
@@ -158,53 +205,93 @@ def _process_shards(
                 print(f"  [{idx}/{len(target_layers)}] {base}  dtype={t.dtype}  shape={tuple(t.shape)}")
                 continue
 
-            packed_cpu = tensors[weight_name]
-
-            scale_cpu = tensors.get(scale_name)
-            if scale_cpu is None:
-                scale_cpu = _load_tensor_from_specific_shard(
-                    input_path, weight_map[scale_name], scale_name
-                )
-
-            gscale_cpu = tensors.get(gscale_name)
-            if gscale_cpu is None:
-                gscale_cpu = _load_tensor_from_specific_shard(
-                    input_path, weight_map[gscale_name], gscale_name
-                )
-
-            mode = "fakequant" if vanilla else "fakequant+scale"
-            print(f"  [{idx}/{len(target_layers)}] {mode} {base}")
-
-            if vanilla:
-                quantized_packed = quantizer._fakequant_layer_vanilla(
-                    packed_cpu.to(device=device),
-                    scale_cpu.to(device=device),
-                    gscale_cpu.to(device=device),
-                )
-                tensors[weight_name] = quantized_packed.to(device="cpu")
+            if input_format == "bf16":
+                bf16_cpu = tensors[weight_name]
+                if output_format == "bf16":
+                    print(f"  [{idx}/{len(target_layers)}] bf16→bf16 {base}")
+                    quantized = quantizer.fakequant_layer_bf16(bf16_cpu.to(device=device))
+                    tensors[weight_name] = quantized.to(device="cpu")
+                else:
+                    print(f"  [{idx}/{len(target_layers)}] bf16→nvfp4 {base}")
+                    w = bf16_cpu.to(device=device, dtype=torch.float32)
+                    blocks = w.reshape(-1, 16)
+                    opt_fp4, opt_scale = quantizer.fakequant_blocks_with_scale(blocks)
+                    out_features, in_features = w.shape
+                    opt_fp4 = opt_fp4.reshape(out_features, in_features)
+                    new_scale = opt_scale.reshape(out_features, in_features // 16)
+                    gscale = torch.tensor([1.0], dtype=torch.float32, device=device)
+                    new_weight_scale = quantizer._cast_scale_to_fp8(new_scale / gscale)
+                    tensors[weight_name] = quantizer.pack_fp4_to_uint8(opt_fp4).to(device="cpu")
+                    tensors[f"{base}.weight_scale"] = new_weight_scale.to(dtype=torch.float8_e4m3fn, device="cpu")
+                    tensors[f"{base}.weight_scale_2"] = gscale.to(device="cpu")
             else:
-                quantized_packed, new_scale = quantizer.fakequant_layer(
-                    packed_cpu.to(device=device),
-                    scale_cpu.to(device=device),
-                    gscale_cpu.to(device=device),
-                )
-                tensors[weight_name] = quantized_packed.to(device="cpu")
-                tensors[scale_name] = new_scale.to(device="cpu")
+                scale_name = f"{base}.weight_scale"
+                gscale_name = _resolve_gscale_name(base, weight_map)
+                packed_cpu = tensors[weight_name]
+
+                scale_cpu = tensors.get(scale_name)
+                if scale_cpu is None:
+                    scale_cpu = _load_tensor_from_specific_shard(
+                        input_path, weight_map[scale_name], scale_name
+                    )
+
+                gscale_cpu = tensors.get(gscale_name)
+                if gscale_cpu is None:
+                    gscale_cpu = _load_tensor_from_specific_shard(
+                        input_path, weight_map[gscale_name], gscale_name
+                    )
+
+                if output_format == "bf16":
+                    print(f"  [{idx}/{len(target_layers)}] nvfp4→bf16 {base}")
+                    fp4_values = quantizer.unpack_uint8_to_fp4(packed_cpu.to(device=device))
+                    gscale = gscale_cpu.to(device=device, dtype=torch.float32).reshape(1)
+                    scale_expanded = scale_cpu.to(device=device, dtype=torch.float32).repeat_interleave(16, dim=1)
+                    bf16_weights = fp4_values * scale_expanded * gscale
+                    quantized = quantizer.fakequant_layer_bf16(bf16_weights)
+                    tensors[weight_name] = quantized.to(device="cpu")
+                    for drop_key in [scale_name, gscale_name]:
+                        tensors.pop(drop_key, None)
+                else:
+                    mode = "fakequant" if vanilla else "fakequant+scale"
+                    print(f"  [{idx}/{len(target_layers)}] {mode} {base}")
+                    if vanilla:
+                        quantized_packed = quantizer._fakequant_layer_vanilla(
+                            packed_cpu.to(device=device),
+                            scale_cpu.to(device=device),
+                            gscale_cpu.to(device=device),
+                        )
+                        tensors[weight_name] = quantized_packed.to(device="cpu")
+                    else:
+                        quantized_packed, new_scale = quantizer.fakequant_layer(
+                            packed_cpu.to(device=device),
+                            scale_cpu.to(device=device),
+                            gscale_cpu.to(device=device),
+                        )
+                        tensors[weight_name] = quantized_packed.to(device="cpu")
+                        tensors[scale_name] = new_scale.to(device="cpu")
 
         if not dry_run:
             save_file(tensors, str(output_shard))
             print(f"[{shard_idx}/{len(shard_order)}] Saved: {shard_rel}")
 
 
-def run(input_path: Path, output_path: Path, device: str, mlp_only: bool, dry_run: bool, vanilla: bool = False) -> None:
+def run(input_path: Path, output_path: Path, device: str, mlp_only: bool, dry_run: bool, vanilla: bool = False, output_format: str | None = None) -> None:
     if not input_path.exists() or not input_path.is_dir():
         raise FileNotFoundError(f"Input path does not exist or is not a directory: {input_path}")
 
     weight_map = _load_index(input_path)
-    all_layers = _find_quantized_layers(weight_map)
+    input_format = detect_input_format(weight_map)
+    if output_format is None:
+        output_format = detect_output_format()
+
+    if input_format == "nvfp4":
+        all_layers = _find_quantized_layers(weight_map)
+    else:
+        all_layers = _find_bf16_layers(weight_map)
     target_layers = _filter_layers(all_layers, mlp_only)
 
-    print(f"Quantized layers in model: {len(all_layers)}")
+    print(f"Input format: {input_format}  Output format: {output_format}")
+    print(f"Layers in model: {len(all_layers)}")
     print(f"Selected for processing: {len(target_layers)}")
     if mlp_only:
         print(f"Skipped (non-MLP): {len(all_layers) - len(target_layers)}")
@@ -219,6 +306,8 @@ def run(input_path: Path, output_path: Path, device: str, mlp_only: bool, dry_ru
             quantizer=CodebookQuantizer(),
             device=torch.device("cpu"),
             dry_run=True,
+            input_format=input_format,
+            output_format=output_format,
         )
         return
 
@@ -236,6 +325,8 @@ def run(input_path: Path, output_path: Path, device: str, mlp_only: bool, dry_ru
         device=resolved_device,
         dry_run=False,
         vanilla=vanilla,
+        input_format=input_format,
+        output_format=output_format,
     )
 
     elapsed = time.perf_counter() - start_time
@@ -244,7 +335,7 @@ def run(input_path: Path, output_path: Path, device: str, mlp_only: bool, dry_ru
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Apply codebook fake-quantization to NVFP4 quantized layers."
+        description="Apply codebook fake-quantization to quantized or BF16 layers."
     )
     default_input = "models/Qwen3-30B-A3B-NVFP4"
     default_output = default_input + "-CBINT2"
@@ -257,6 +348,8 @@ def main() -> None:
                         help="Print target layer names and shapes without quantizing")
     parser.add_argument("--vanilla", action="store_true",
                         help="Use vanilla codebook selection without scale optimization")
+    parser.add_argument("--output-format", type=str, default=None, choices=["nvfp4", "bf16"],
+                        help="Output format (default: auto-detect from GPU or CBINT2_COMPUTE_CAP env)")
     args = parser.parse_args()
 
     run(
@@ -266,6 +359,7 @@ def main() -> None:
         mlp_only=args.mlp_only,
         dry_run=args.dry_run,
         vanilla=args.vanilla,
+        output_format=args.output_format,
     )
 
 

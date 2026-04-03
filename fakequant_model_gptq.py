@@ -3,135 +3,63 @@ from __future__ import annotations
 # pyright: reportMissingImports=false, reportUnknownVariableType=false, reportUnknownMemberType=false, reportUnknownArgumentType=false, reportUnusedCallResult=false
 
 import argparse
-import math
 import time
 from pathlib import Path
 
 import torch
-from datasets import load_dataset
 from safetensors.torch import load_file, save_file
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from fakequant import CodebookQuantizer
 from fakequant_model import (
     _copy_non_safetensors_files,
     _default_device,
     _filter_layers,
+    _find_bf16_layers,
     _find_quantized_layers,
     _load_index,
     _load_tensor_from_specific_shard,
     _resolve_gscale_name,
     _resolve_weight_name,
+    detect_input_format,
+    detect_output_format,
 )
 from gptq import CodebookGPTQ
+from gptq.calibrate import hessian_block_keys, layer_block_index, load_hessian
 
 
-def _collect_hessians(
-    calibration_model: str,
-    num_samples: int,
-    seq_len: int,
-    collect_weights: bool = False,
-) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-    print(f"\n=== Calibration: {calibration_model} ===")
-    tokenizer = AutoTokenizer.from_pretrained(calibration_model, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        calibration_model,
-        torch_dtype=torch.float16,
-        device_map="auto",
-        trust_remote_code=True,
+def _format_missing_layers(missing_layers: list[str], artifact_label: str, artifact_dir: Path) -> str:
+    preview = ", ".join(missing_layers[:3])
+    suffix = "" if len(missing_layers) <= 3 else ", ..."
+    return (
+        f"Missing {len(missing_layers)} {artifact_label} in {artifact_dir}. "
+        f"Examples: {preview}{suffix}"
     )
-    model.eval()
 
-    dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
-    text = "\n\n".join(dataset["text"])
-    tokens = tokenizer(text, return_tensors="pt").input_ids[0]
 
-    samples = []
-    for i in range(0, len(tokens) - seq_len, seq_len):
-        if len(samples) >= num_samples:
-            break
-        samples.append(tokens[i : i + seq_len].unsqueeze(0))
-    print(f"  {len(samples)} sequences x {seq_len} tokens")
+def _group_layers_by_block(target_layers: list[str]) -> dict[int, list[str]]:
+    layers_by_block: dict[int, list[str]] = {}
+    for layer_name in target_layers:
+        block_idx = layer_block_index(layer_name)
+        if block_idx is None:
+            raise ValueError(f"Target layer is not inside a transformer block: {layer_name}")
+        layers_by_block.setdefault(block_idx, []).append(layer_name)
+    return layers_by_block
 
-    block_layers: dict[int, list[tuple[str, torch.nn.Module]]] = {}
-    for name, module in model.named_modules():
-        if not isinstance(module, torch.nn.Linear):
-            continue
-        parts = name.split(".")
-        block_idx = None
-        for j, p in enumerate(parts):
-            if p == "layers" and j + 1 < len(parts) and parts[j + 1].isdigit():
-                block_idx = int(parts[j + 1])
-                break
-        if block_idx is not None:
-            block_layers.setdefault(block_idx, []).append((name, module))
 
-    num_blocks = len(block_layers)
-    print(f"  {num_blocks} transformer blocks, processing one at a time")
+def _validate_local_calibration_artifacts(
+    artifact_dir: Path,
+    target_layers: list[str],
+) -> None:
+    missing_hessians: list[str] = []
+    for block_idx, layer_names in _group_layers_by_block(target_layers).items():
+        available_keys = hessian_block_keys(artifact_dir, block_idx)
+        missing_hessians.extend(layer_name for layer_name in layer_names if layer_name not in available_keys)
 
-    hessians: dict[str, torch.Tensor] = {}
-    device = next(model.parameters()).device
-
-    for block_idx in sorted(block_layers.keys()):
-        layers_in_block = block_layers[block_idx]
-        block_hessians: dict[str, torch.Tensor] = {}
-        block_counts: dict[str, int] = {}
-
-        def make_hook(layer_name: str):
-            def hook_fn(module, inp, out):
-                X = inp[0].detach()
-                if X.dim() == 3:
-                    X = X.reshape(-1, X.shape[-1])
-                X = X.float()
-                n = X.shape[0]
-                d = X.shape[1]
-                if layer_name not in block_hessians:
-                    block_hessians[layer_name] = torch.zeros(d, d, device=X.device, dtype=torch.float32)
-                    block_counts[layer_name] = 0
-                sc = block_counts[layer_name]
-                beta = sc / (sc + n)
-                alpha = 2.0 / (sc + n)
-                X_scaled = X.mul(math.sqrt(alpha))
-                block_hessians[layer_name].mul_(beta).addmm_(X_scaled.T, X_scaled)
-                block_counts[layer_name] = sc + n
-            return hook_fn
-
-        hooks = []
-        for name, module in layers_in_block:
-            hooks.append(module.register_forward_hook(make_hook(name)))
-
-        cal_batch_size = 4
-        for b_start in range(0, len(samples), cal_batch_size):
-            batch = torch.cat(samples[b_start:b_start + cal_batch_size], dim=0).to(device)
-            with torch.no_grad():
-                model(batch, use_cache=False)
-            del batch
-            torch.cuda.empty_cache()
-
-        for h in hooks:
-            h.remove()
-
-        for name, H in block_hessians.items():
-            hessians[name] = H.cpu()
-        del block_hessians
-        torch.cuda.empty_cache()
-
-        print(f"  block {block_idx}/{num_blocks - 1}: {len(layers_in_block)} layers done")
-
-    bf16_weights: dict[str, torch.Tensor] = {}
-    if collect_weights:
-        print(f"  Extracting BF16 reference weights...")
-        for name, module in model.named_modules():
-            if isinstance(module, torch.nn.Linear):
-                bf16_weights[name] = module.weight.data.float().cpu()
-        print(f"  Extracted {len(bf16_weights)} weight matrices")
-
-    del model
-    torch.cuda.empty_cache()
-
-    print(f"  Collected {len(hessians)} Hessians total")
-
-    return hessians, bf16_weights
+    if missing_hessians:
+        raise FileNotFoundError(
+            _format_missing_layers(missing_hessians, "Hessian entries", artifact_dir)
+            + ". Run `python -m gptq.calibrate --output-dir ...` first."
+        )
 
 
 def _process_shards_gptq(
@@ -141,9 +69,10 @@ def _process_shards_gptq(
     target_layers: list[str],
     quantizer: CodebookQuantizer,
     device: torch.device,
-    hessians: dict[str, torch.Tensor],
-    bf16_ref_weights: dict[str, torch.Tensor],
+    calibration_dir: Path,
     dry_run: bool,
+    input_format: str = "nvfp4",
+    output_format: str = "nvfp4",
 ) -> None:
     shard_order: list[str] = []
     seen: set[str] = set()
@@ -155,9 +84,12 @@ def _process_shards_gptq(
     layer_to_idx = {b: idx + 1 for idx, b in enumerate(target_layers)}
 
     print(f"\nTarget layers: {len(target_layers)} across {len(shard_order)} shard(s).")
+    print(f"Input format: {input_format}  Output format: {output_format}")
     if not dry_run:
         print(f"Using device: {device}")
-        print(f"Hessians available: {len(hessians)}")
+        print(f"Calibration dir: {calibration_dir}")
+
+    block_key_cache: dict[int, set[str]] = {}
 
     for shard_idx, shard_rel in enumerate(shard_order, start=1):
         input_shard = input_path / shard_rel
@@ -185,59 +117,68 @@ def _process_shards_gptq(
 
             if dry_run:
                 t = tensors[weight_name]
-                h_status = "✓" if base in hessians else "✗"
+                block_idx = layer_block_index(base)
+                if block_idx is None:
+                    raise ValueError(f"Target layer is not inside a transformer block: {base}")
+                if block_idx not in block_key_cache:
+                    block_key_cache[block_idx] = hessian_block_keys(calibration_dir, block_idx)
+                h_status = "✓" if base in block_key_cache[block_idx] else "✗"
                 print(f"  [{idx}/{len(target_layers)}] {base}  shape={tuple(t.shape)}  hessian={h_status}")
                 continue
 
-            packed_cpu = tensors[weight_name]
-            scale_cpu = tensors.get(scale_name)
-            if scale_cpu is None:
-                scale_cpu = _load_tensor_from_specific_shard(
-                    input_path, weight_map[scale_name], scale_name
-                )
-            gscale_cpu = tensors.get(gscale_name)
-            if gscale_cpu is None:
-                gscale_cpu = _load_tensor_from_specific_shard(
-                    input_path, weight_map[gscale_name], gscale_name
-                )
-
-            packed = packed_cpu.to(device=device)
-            scale = scale_cpu.to(device=device)
-            gscale = gscale_cpu.to(device=device, dtype=torch.float32).reshape(1)
-
-            fp4_values = quantizer.unpack_uint8_to_fp4(packed)
-            out_features, in_features = fp4_values.shape
-            scale_expanded = scale.to(torch.float32).repeat_interleave(16, dim=1)
-
-            W_ref = bf16_ref_weights.get(base)
-            if W_ref is not None:
-                bf16_weights = W_ref.to(device)
+            gscale_for_output = torch.tensor([1.0], device=device)
+            if input_format == "bf16":
+                w = tensors[weight_name].to(device=device, dtype=torch.float32)
+                _, in_features = w.shape
                 ref_mode = "bf16"
             else:
-                bf16_weights = fp4_values * scale_expanded * gscale
+                packed_cpu = tensors[weight_name]
+                scale_cpu = tensors.get(scale_name)
+                if scale_cpu is None:
+                    scale_cpu = _load_tensor_from_specific_shard(
+                        input_path, weight_map[scale_name], scale_name
+                    )
+                gscale_cpu = tensors.get(gscale_name)
+                if gscale_cpu is None:
+                    gscale_cpu = _load_tensor_from_specific_shard(
+                        input_path, weight_map[gscale_name], gscale_name
+                    )
+                packed = packed_cpu.to(device=device)
+                scale = scale_cpu.to(device=device)
+                gscale_for_output = gscale_cpu.to(device=device, dtype=torch.float32).reshape(1)
+                fp4_values = quantizer.unpack_uint8_to_fp4(packed)
+                _, in_features = fp4_values.shape
+                scale_expanded = scale.to(torch.float32).repeat_interleave(16, dim=1)
+                w = fp4_values * scale_expanded * gscale_for_output
                 ref_mode = "nvfp4"
 
             gptq = CodebookGPTQ(in_features=in_features, quantizer=quantizer)
 
-            H = hessians.get(base)
-            if H is not None:
-                gptq.H = H.to(device)
-                gptq.num_samples = 1
+            hessian = load_hessian(calibration_dir, base)
+            if hessian is None:
+                raise FileNotFoundError(f"Missing Hessian for {base} in {calibration_dir}")
+            gptq.H = hessian.to(device)
+            gptq.num_samples = 1
+
+            print(f"  [{idx}/{len(target_layers)}] gptq({ref_mode})→{output_format} {base}")
+
+            fp4_out, scales_out, _ = gptq.quantize(w)
+
+            if output_format == "bf16":
+                dequantized = (fp4_out * scales_out).to(dtype=torch.bfloat16)
+                tensors[weight_name] = dequantized.to(device="cpu")
+                for drop_key in [scale_name, gscale_name]:
+                    tensors.pop(drop_key, None)
             else:
-                print(f"  [{idx}/{len(target_layers)}] WARNING: no Hessian for {base}, using random")
-                gptq.update(torch.randn(256, in_features, device=device))
+                gscale_val = gscale_for_output
+                new_packed = quantizer.pack_fp4_to_uint8(fp4_out)
+                new_weight_scale = quantizer._cast_scale_to_fp8(scales_out / gscale_val)
+                tensors[weight_name] = new_packed.to(device="cpu")
+                tensors[scale_name] = new_weight_scale.to(dtype=torch.float8_e4m3fn, device="cpu")
+                if input_format == "bf16":
+                    tensors[f"{base}.weight_scale_2"] = gscale_val.to(device="cpu")
 
-            print(f"  [{idx}/{len(target_layers)}] gptq({ref_mode}) {base}")
-
-            fp4_out, scales_out, _ = gptq.quantize(bf16_weights)
-
-            new_packed = quantizer.pack_fp4_to_uint8(fp4_out)
-            new_weight_scale = quantizer._cast_scale_to_fp8(scales_out / gscale)
-
-            tensors[weight_name] = new_packed.to(device="cpu")
-            tensors[scale_name] = new_weight_scale.to(dtype=scale_cpu.dtype, device="cpu")
-
-            del gptq, bf16_weights, fp4_values
+            del gptq, w, hessian
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
@@ -252,47 +193,36 @@ def run(
     device: str,
     mlp_only: bool,
     dry_run: bool,
-    calibration_model: str,
-    num_samples: int,
-    seq_len: int,
-    ref: str = "nvfp4",
-    hessian_dir: str | None = None,
+    hessian_dir: str = "hessians",
+    output_format: str | None = None,
 ) -> None:
     if not input_path.exists() or not input_path.is_dir():
         raise FileNotFoundError(f"Input path does not exist or is not a directory: {input_path}")
 
     weight_map = _load_index(input_path)
-    all_layers = _find_quantized_layers(weight_map)
+    input_format = detect_input_format(weight_map)
+    if output_format is None:
+        output_format = detect_output_format()
+
+    if input_format == "nvfp4":
+        all_layers = _find_quantized_layers(weight_map)
+    else:
+        all_layers = _find_bf16_layers(weight_map)
     target_layers = _filter_layers(all_layers, mlp_only)
 
-    print(f"Quantized layers in model: {len(all_layers)}")
+    print(f"Input format: {input_format}  Output format: {output_format}")
+    print(f"Layers in model: {len(all_layers)}")
     print(f"Selected for processing: {len(target_layers)}")
     if mlp_only:
         print(f"Skipped (non-MLP): {len(all_layers) - len(target_layers)}")
 
-    use_bf16_ref = ref == "bf16"
-
-    if hessian_dir is not None:
-        hessian_path = Path(hessian_dir)
-        print(f"\nLoading pre-computed Hessians from {hessian_path}")
-        hessians: dict[str, torch.Tensor] = {}
-        for base in target_layers:
-            h_file = hessian_path / f"{base}.pt"
-            if h_file.exists():
-                hessians[base] = torch.load(h_file, map_location="cpu", weights_only=True)
-        print(f"  Loaded {len(hessians)}/{len(target_layers)} Hessians")
-        bf16_ref_weights: dict[str, torch.Tensor] = {}
-        if use_bf16_ref:
-            print("WARNING: --ref=bf16 with --hessian-dir requires separate BF16 weight extraction. Falling back to nvfp4.")
-            use_bf16_ref = False
-    else:
-        hessians, bf16_ref_weights = _collect_hessians(
-            calibration_model, num_samples, seq_len,
-            collect_weights=use_bf16_ref,
+    hessian_path = Path(hessian_dir)
+    if not hessian_path.exists() or not hessian_path.is_dir():
+        raise FileNotFoundError(
+            f"Calibration directory does not exist or is not a directory: {hessian_path}. "
+            + "Run `python -m gptq.calibrate --output-dir ...` first."
         )
-
-    if not use_bf16_ref:
-        bf16_ref_weights = {}
+    _validate_local_calibration_artifacts(hessian_path, target_layers)
 
     if dry_run:
         print("\n=== DRY RUN (no writes) ===\n")
@@ -303,9 +233,10 @@ def run(
             target_layers=target_layers,
             quantizer=CodebookQuantizer(),
             device=torch.device("cpu"),
-            hessians=hessians,
-            bf16_ref_weights=bf16_ref_weights,
+            calibration_dir=hessian_path,
             dry_run=True,
+            input_format=input_format,
+            output_format=output_format,
         )
         return
 
@@ -321,9 +252,10 @@ def run(
         target_layers=target_layers,
         quantizer=quantizer,
         device=resolved_device,
-        hessians=hessians,
-        bf16_ref_weights=bf16_ref_weights,
+        calibration_dir=hessian_path,
         dry_run=False,
+        input_format=input_format,
+        output_format=output_format,
     )
 
     elapsed = time.perf_counter() - start_time
@@ -332,7 +264,7 @@ def run(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Apply GPTQ-optimized codebook quantization to NVFP4 layers."
+        description="Apply GPTQ-optimized codebook quantization to NVFP4 or BF16 layers."
     )
     default_input = "models/Qwen3-30B-A3B-NVFP4"
     default_output = default_input + "-CBINT2-GPTQ"
@@ -341,16 +273,10 @@ def main() -> None:
     parser.add_argument("--device", type=str, default=_default_device())
     parser.add_argument("--mlp-only", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--calibration-model", type=str, default="Qwen/Qwen3-30B-A3B",
-                        help="HuggingFace model for calibration (default: Qwen/Qwen3-30B-A3B)")
-    parser.add_argument("--num-samples", type=int, default=128,
-                        help="Calibration sequences (default: 128)")
-    parser.add_argument("--seq-len", type=int, default=2048,
-                        help="Sequence length per sample (default: 2048)")
-    parser.add_argument("--ref", type=str, default="nvfp4", choices=["nvfp4", "bf16"],
-                        help="Reference weights: nvfp4=dequantized input (default), bf16=from calibration model")
-    parser.add_argument("--hessian-dir", type=str, default=None,
-                        help="Load pre-computed Hessians instead of running calibration")
+    parser.add_argument("--hessian-dir", type=str, required=True,
+                        help="Local calibration directory produced by `python -m gptq.calibrate --output-dir ...`")
+    parser.add_argument("--output-format", type=str, default=None, choices=["nvfp4", "bf16"],
+                        help="Output format (default: auto-detect from GPU or CBINT2_COMPUTE_CAP env)")
     args = parser.parse_args()
 
     run(
@@ -359,11 +285,8 @@ def main() -> None:
         device=args.device,
         mlp_only=args.mlp_only,
         dry_run=args.dry_run,
-        calibration_model=args.calibration_model,
-        num_samples=args.num_samples,
-        seq_len=args.seq_len,
-        ref=args.ref,
         hessian_dir=args.hessian_dir,
+        output_format=args.output_format,
     )
 
 

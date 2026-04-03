@@ -229,7 +229,7 @@ class CodebookQuantizer:
         fp4 = self.fp4_representable.to(device=values.device)
         return (values.unsqueeze(-1) - fp4).abs().argmin(dim=-1)
 
-    def fakequant_blocks_with_scale(self, bf16_weights, max_iters=3):
+    def fakequant_blocks_with_scale(self, bf16_weights):
         if bf16_weights.dim() != 2 or bf16_weights.shape[1] != 16:
             raise ValueError(
                 f"bf16_weights must have shape [num_blocks, 16], got {tuple(bf16_weights.shape)}"
@@ -241,19 +241,48 @@ class CodebookQuantizer:
         fp4 = self.fp4_representable.to(device=device)
         value_table = self._value_table.to(device=device)
 
-        s = self._cast_scale_to_fp8(w.abs().amax(dim=-1, keepdim=True) / 6.0)
+        s_init = self._cast_scale_to_fp8(w.abs().amax(dim=-1, keepdim=True) / 6.0)
+        fp4_idx = (w / s_init).unsqueeze(-1).sub(fp4).abs().argmin(dim=-1)
 
-        for _ in range(max_iters):
-            scaled = w / s
-            fp4_idx = (scaled.unsqueeze(-1) - fp4).abs().argmin(dim=-1)
-            mapped = value_table[fp4_idx]
-            best_k = ((scaled.unsqueeze(-1) - mapped) ** 2).mean(dim=1).argmin(dim=-1)
-            q = mapped.gather(2, best_k.view(-1, 1, 1).expand(-1, 16, 1)).squeeze(2)
-            numer = (w * q).sum(dim=-1, keepdim=True)
-            denom = (q * q).sum(dim=-1, keepdim=True).clamp(min=1e-10)
-            s = self._cast_scale_to_fp8(numer / denom)
+        q_all = value_table[fp4_idx]
+        numer = (w.unsqueeze(-1) * q_all).sum(dim=1)
+        denom = (q_all ** 2).sum(dim=1).clamp(min=1e-10)
+
+        s_all = self._cast_scale_to_fp8(numer / denom)
+        w_sq = (w ** 2).sum(dim=1, keepdim=True)
+        mse_all = w_sq - 2 * s_all * numer + s_all ** 2 * denom
+        mse_all[numer <= 0] = float("inf")
+
+        best_k = mse_all.argmin(dim=-1)
+
+        q = q_all.gather(2, best_k.view(-1, 1, 1).expand(-1, 16, 1)).squeeze(2)
+        s = s_all.gather(1, best_k.unsqueeze(1))
 
         return q, s
+
+    def fakequant_layer_bf16(self, bf16_weights: torch.Tensor) -> torch.Tensor:
+        """Codebook-quantize full-precision weights and return dequantized BF16 result.
+
+        Input:  bf16_weights  — shape [out_features, in_features], any float dtype
+        Output: bf16 tensor   — shape [out_features, in_features], codebook-constrained values
+                                (= codebook_fp4 * optimized_scale, baked into BF16)
+
+        The returned tensor has the same shape as the input but each 16-element
+        block is constrained to at most 4 distinct FP4 values times a per-block
+        FP8-rounded scale.  This is the A100-compatible path: no FP4 tensor cores
+        required at inference time.
+        """
+        w = bf16_weights.to(dtype=torch.float32)
+        if w.dim() != 2:
+            raise ValueError(f"bf16_weights must be 2D [out, in], got {tuple(w.shape)}")
+        out_features, in_features = w.shape
+        if in_features % 16 != 0:
+            raise ValueError(f"in_features ({in_features}) must be divisible by 16")
+
+        blocks = w.reshape(-1, 16)
+        opt_fp4, opt_scale = self.fakequant_blocks_with_scale(blocks)
+        dequantized = (opt_fp4 * opt_scale).reshape(out_features, in_features)
+        return dequantized.to(dtype=bf16_weights.dtype)
 
     @staticmethod
     def _fakequant_blocks_chunk(source, fp4, error_table, value_table):

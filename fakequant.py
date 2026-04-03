@@ -10,12 +10,7 @@ class CodebookQuantizer:
     FP4_MAGNITUDES: Final[tuple[float, ...]] = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
     MAX_CODEBOOK_TENSOR_BYTES: Final[int] = 4 * 1024 * 1024 * 1024
 
-    def __init__(self, policy: str = "top3_nonzero"):
-        if policy != "top3_nonzero":
-            raise NotImplementedError(
-                f"Unsupported policy '{policy}'. Only 'top3_nonzero' is implemented."
-            )
-
+    def __init__(self, policy: str = "top3_nonzero", codebook_path: str | None = None):
         self.policy = policy
         self.fp4_magnitudes = torch.tensor(self.FP4_MAGNITUDES, dtype=torch.float32)
 
@@ -26,7 +21,20 @@ class CodebookQuantizer:
         self.fp4_nonzero_values = self.fp4_representable[1:]
 
         self.nibble_to_fp4 = self._build_nibble_to_fp4_table()
-        self.codebook = self._build_codebook()
+
+        if policy == "top3_nonzero":
+            self.codebook = self._build_codebook()
+        elif policy == "statistical":
+            if codebook_path is None:
+                raise ValueError("codebook_path required for policy='statistical'")
+            self.codebook = torch.load(codebook_path, weights_only=True).to(torch.float32)
+            if self.codebook.dim() != 2 or self.codebook.shape[1] != 4:
+                raise ValueError(
+                    f"Statistical codebook must have shape [K, 4], got {tuple(self.codebook.shape)}"
+                )
+        else:
+            raise NotImplementedError(f"Unsupported policy '{policy}'.")
+
         self._error_table, self._value_table = self._build_lookup_tables()
 
     def _build_nibble_to_fp4_table(self):
@@ -39,16 +47,17 @@ class CodebookQuantizer:
         values[8] = 0.0
         return values.to(torch.float32)
 
+    def set_codebook(self, codebook: torch.Tensor) -> None:
+        if codebook.dim() != 2 or codebook.shape[1] != 4:
+            raise ValueError(f"Codebook must be [K, 4], got {tuple(codebook.shape)}")
+        self.codebook = codebook.to(torch.float32)
+        self._error_table, self._value_table = self._build_lookup_tables()
+
     def _build_codebook(self):
         combos = list(itertools.combinations(self.fp4_nonzero_values.tolist(), 3))
         codebook_rows = [[0.0, combo[0], combo[1], combo[2]] for combo in combos]
         codebook = torch.tensor(codebook_rows, dtype=torch.float32)
-
-        expected_shape = (364, 4)
-        if tuple(codebook.shape) != expected_shape:
-            raise RuntimeError(
-                f"Unexpected codebook shape {tuple(codebook.shape)}; expected {expected_shape}."
-            )
+        assert codebook.shape == (364, 4)
         return codebook
 
     def _build_lookup_tables(self):

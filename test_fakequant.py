@@ -277,6 +277,92 @@ except ValueError:
     print(f"  in_features=15 correctly rejected")
 print(f"  PASS")
 
+print("\n=== Fixed codebook vs statistical codebook comparison ===")
+import itertools
+torch.manual_seed(200)
+
+test_out, test_in = 128, 512
+W_test = torch.randn(test_out, test_in) * 0.3
+
+q_fixed = CodebookQuantizer(policy="top3_nonzero")
+print(f"  Fixed codebook: {tuple(q_fixed.codebook.shape)} (C(14,3)=364, always includes zero)")
+
+fp4_all = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
+all_1365 = torch.tensor(list(itertools.combinations(fp4_all, 4)), dtype=torch.float32)
+
+blocks_test = W_test.reshape(-1, 16)
+num_blocks_test = blocks_test.shape[0]
+
+best_per_block = torch.zeros(num_blocks_test, dtype=torch.long)
+best_mse_per_block = torch.full((num_blocks_test,), float("inf"))
+
+for cb_start in range(0, 1365, 128):
+    cb_end = min(cb_start + 128, 1365)
+    cb_chunk = all_1365[cb_start:cb_end]
+    K = cb_chunk.shape[0]
+
+    dists = (blocks_test[:, :, None, None] - cb_chunk[None, None, :, :]).abs()
+    nearest_idx = dists.argmin(dim=-1)
+    q_vals = cb_chunk[None, None, :, :].expand(num_blocks_test, 16, K, 4)
+    q_mapped = q_vals.gather(3, nearest_idx.unsqueeze(-1)).squeeze(-1)
+
+    numer = (blocks_test.unsqueeze(-1) * q_mapped).sum(dim=1)
+    denom = (q_mapped ** 2).sum(dim=1).clamp(min=1e-10)
+    s_all = numer / denom
+    s_all = s_all.clamp(-448.0, 448.0).clamp(min=1e-10)
+
+    w_sq = (blocks_test ** 2).sum(dim=1, keepdim=True)
+    mse_chunk = w_sq - 2 * s_all * numer + s_all ** 2 * denom
+    mse_chunk[numer <= 0] = float("inf")
+
+    chunk_best_mse, chunk_best_idx = mse_chunk.min(dim=-1)
+    improved = chunk_best_mse < best_mse_per_block
+    best_mse_per_block[improved] = chunk_best_mse[improved]
+    best_per_block[improved] = chunk_best_idx[improved] + cb_start
+
+freq_1365 = torch.zeros(1365, dtype=torch.long)
+for idx in best_per_block.tolist():
+    freq_1365[idx] += 1
+top256_idx = freq_1365.argsort(descending=True)[:256]
+stat_codebook_256 = all_1365[top256_idx]
+
+blocks_fixed = W_test.reshape(-1, 16)
+fp4_fixed, s_fixed = q_fixed.fakequant_blocks_with_scale(blocks_fixed)
+W_q_fixed = (fp4_fixed * s_fixed).reshape(test_out, test_in)
+mse_fixed = ((W_test - W_q_fixed) ** 2).mean().item()
+
+q_stat256 = CodebookQuantizer()
+q_stat256.set_codebook(stat_codebook_256)
+fp4_s256, s_s256 = q_stat256.fakequant_blocks_with_scale(blocks_fixed)
+W_q_s256 = (fp4_s256 * s_s256).reshape(test_out, test_in)
+mse_s256 = ((W_test - W_q_s256) ** 2).mean().item()
+
+with_zero_256 = sum(1 for i in range(stat_codebook_256.shape[0]) if 0.0 in stat_codebook_256[i].tolist())
+without_zero_256 = stat_codebook_256.shape[0] - with_zero_256
+
+selected_freq = sum(freq_1365[i].item() for i in top256_idx.tolist())
+coverage_256 = selected_freq / num_blocks_test * 100
+
+print(f"\n  {'':30s} {'Fixed (364)':>14s} {'Stat-256':>14s}")
+print(f"  {'codebook size':30s} {'364':>14s} {'256':>14s}")
+print(f"  {'weight MSE':30s} {mse_fixed:14.6f} {mse_s256:14.6f}")
+print(f"  {'vs fixed':30s} {'baseline':>14s} {(mse_s256/mse_fixed - 1)*100:+13.1f}%")
+print(f"  {'with-zero codebooks':30s} {'364 (100%)':>14s} {f'{with_zero_256} ({with_zero_256*100//256}%)':>14s}")
+print(f"  {'without-zero codebooks':30s} {'0 (0%)':>14s} {f'{without_zero_256} ({without_zero_256*100//256}%)':>14s}")
+print(f"  {'block coverage':30s} {'100.0%':>14s} {f'{coverage_256:.1f}%':>14s}")
+
+for i in range(fp4_s256.shape[0]):
+    assert len(set(fp4_s256[i].tolist())) <= 4, f"Stat-256 block {i} has >4 distinct"
+
+print(f"\n  Top-10 statistical codebooks (from data):")
+for i in range(min(10, stat_codebook_256.shape[0])):
+    vals = stat_codebook_256[i].tolist()
+    has_zero = "✓" if 0.0 in vals else "✗"
+    f_count = freq_1365[top256_idx[i]].item()
+    print(f"    #{i+1}: {vals}  zero={has_zero}  freq={f_count}/{num_blocks_test} ({f_count/num_blocks_test*100:.1f}%)")
+
+print(f"  PASS")
+
 if args.benchmark:
     import time
     bench_out, bench_in = 2048, 768

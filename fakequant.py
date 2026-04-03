@@ -229,7 +229,12 @@ class CodebookQuantizer:
         fp4 = self.fp4_representable.to(device=values.device)
         return (values.unsqueeze(-1) - fp4).abs().argmin(dim=-1)
 
-    def fakequant_blocks_with_scale(self, bf16_weights, return_codebook_idx: bool = False):
+    def fakequant_blocks_with_scale(
+        self,
+        bf16_weights,
+        return_codebook_idx: bool = False,
+        importance_weights: torch.Tensor | None = None,
+    ):
         if bf16_weights.dim() != 2 or bf16_weights.shape[1] != 16:
             raise ValueError(
                 f"bf16_weights must have shape [num_blocks, 16], got {tuple(bf16_weights.shape)}"
@@ -245,12 +250,23 @@ class CodebookQuantizer:
         fp4_idx = (w / s_init).unsqueeze(-1).sub(fp4).abs().argmin(dim=-1)
 
         q_all = value_table[fp4_idx]
-        numer = (w.unsqueeze(-1) * q_all).sum(dim=1)
-        denom = (q_all ** 2).sum(dim=1).clamp(min=1e-10)
 
-        s_all = self._cast_scale_to_fp8(numer / denom)
-        w_sq = (w ** 2).sum(dim=1, keepdim=True)
-        mse_all = w_sq - 2 * s_all * numer + s_all ** 2 * denom
+        if importance_weights is not None:
+            imp = importance_weights.to(dtype=torch.float32, device=device)
+            imp = imp / imp.mean(dim=-1, keepdim=True).clamp(min=1e-10)
+            imp_3d = imp.unsqueeze(-1)
+            numer = (imp_3d * w.unsqueeze(-1) * q_all).sum(dim=1)
+            denom = (imp_3d * q_all ** 2).sum(dim=1).clamp(min=1e-10)
+            s_all = self._cast_scale_to_fp8(numer / denom)
+            w_sq = (imp * w ** 2).sum(dim=1, keepdim=True)
+            mse_all = w_sq - 2 * s_all * numer + s_all ** 2 * denom
+        else:
+            numer = (w.unsqueeze(-1) * q_all).sum(dim=1)
+            denom = (q_all ** 2).sum(dim=1).clamp(min=1e-10)
+            s_all = self._cast_scale_to_fp8(numer / denom)
+            w_sq = (w ** 2).sum(dim=1, keepdim=True)
+            mse_all = w_sq - 2 * s_all * numer + s_all ** 2 * denom
+
         mse_all[numer <= 0] = float("inf")
 
         best_k = mse_all.argmin(dim=-1)

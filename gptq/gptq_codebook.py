@@ -15,11 +15,13 @@ class CodebookGPTQ:
         quantizer: CodebookQuantizer | None = None,
         rel_damp: float = 1e-2,
         block_size: int = 128,
+        use_importance: bool = True,
     ):
         self.in_features = in_features
         self.quantizer = quantizer or CodebookQuantizer()
         self.rel_damp = rel_damp
         self.block_size = block_size
+        self.use_importance = use_importance
         assert block_size % 16 == 0, "block_size must be a multiple of 16"
 
         self.H: torch.Tensor | None = None
@@ -56,6 +58,7 @@ class CodebookGPTQ:
         assert in_features % 16 == 0
 
         H_inv_cho = self._get_hessian_inverse()
+        h_diag = self.H.diag() if self.use_importance else None
 
         all_fp4 = torch.zeros_like(W)
         all_fp4_phase1 = torch.zeros_like(W)
@@ -73,9 +76,14 @@ class CodebookGPTQ:
                 g_end = min(g + 16, c2 - c1)
                 w_group = w_blk[:, g:g_end]
 
+                group_importance = None
+                if h_diag is not None:
+                    group_importance = h_diag[c1 + g:c1 + g_end].unsqueeze(0)
+
                 q_phase1, s_opt, best_k = self.quantizer.fakequant_blocks_with_scale(
                     w_group.reshape(-1, 16),
                     return_codebook_idx=True,
+                    importance_weights=group_importance,
                 )
                 all_fp4_phase1[:, c1 + g:c1 + g_end] = q_phase1.reshape_as(w_group)
                 s_opt = s_opt.reshape(out_features, 1)

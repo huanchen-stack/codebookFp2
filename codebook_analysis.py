@@ -251,6 +251,7 @@ def _save_layer_result(
     selected_indices: torch.Tensor,
     num_candidates: int,
     output_dir: Path,
+    optimality_pct: float = 0.0,
 ) -> None:
     sanitized = _sanitize_layer_name(layer_name)
     torch.save(layer_codebook, str(output_dir / f"{sanitized}.pt"))
@@ -268,13 +269,14 @@ def _save_layer_result(
     )
 
     coverage_curve = _compute_coverage_at_k(
-        freq, num_blocks_layer, [32, 64, 128, 256, 512]
+        freq, num_blocks_layer, [16, 32, 64, 128, 256, 512]
     )
 
     stats = {
         "num_blocks": num_blocks_layer,
         "num_codebooks": int(layer_codebook.shape[0]),
         "coverage_at_256": round(coverage_256, 4),
+        "optimality_pct": round(optimality_pct, 4),
         "with_zero_count": with_zero,
         "without_zero_count": without_zero,
         "without_zero_pct": round(without_zero_pct, 4),
@@ -364,6 +366,7 @@ def _process_block_on_gpu(
 
     all_winners_list: list[torch.Tensor] = []
     all_mse_list: list[torch.Tensor] = []
+    all_optimal_mse_list: list[torch.Tensor] = []
 
     for b_start in range(0, total_blocks, chunk_size):
         b_end = min(b_start + chunk_size, total_blocks)
@@ -371,6 +374,7 @@ def _process_block_on_gpu(
             all_blocks[b_start:b_end], all_importance[b_start:b_end], all_codebooks
         )
         all_winners_list.append(winners.cpu())
+        all_optimal_mse_list.append(mse_matrix.min(dim=-1).values)
         if selection_method == "greedy":
             all_mse_list.append(mse_matrix.cpu())
 
@@ -378,10 +382,11 @@ def _process_block_on_gpu(
     torch.cuda.empty_cache()
 
     all_winners = torch.cat(all_winners_list)
+    all_optimal_mse = torch.cat(all_optimal_mse_list)
     all_mse_full = torch.cat(all_mse_list, dim=0) if all_mse_list else None
-    del all_winners_list, all_mse_list
+    del all_winners_list, all_mse_list, all_optimal_mse_list
 
-    for i, (layer_name, layer_idx, blocks_i, _) in enumerate(layer_data):
+    for i, (layer_name, layer_idx, blocks_i, imp_i) in enumerate(layer_data):
         start, end = offsets[i]
         num_blocks_layer = end - start
         layer_winners = all_winners[start:end]
@@ -400,6 +405,25 @@ def _process_block_on_gpu(
             )
 
         layer_codebook = all_codebooks[selected_indices].cpu()
+
+        selected_cbs = all_codebooks[selected_indices]
+        opt_mse_layer = all_optimal_mse[start:end]
+        sel_sum = torch.tensor(0.0, device=device)
+        opt_sum = torch.tensor(0.0, device=device)
+        for bs in range(0, num_blocks_layer, chunk_size):
+            be = min(bs + chunk_size, num_blocks_layer)
+            _, sel_mse = _evaluate_codebooks_batch(
+                blocks_i[bs:be], imp_i[bs:be], selected_cbs
+            )
+            sel_best = sel_mse.min(dim=-1).values
+            opt_chunk = opt_mse_layer[bs:be]
+            valid = torch.isfinite(sel_best) & torch.isfinite(opt_chunk)
+            sel_sum += sel_best[valid].sum()
+            opt_sum += opt_chunk[valid].sum()
+            del sel_mse, sel_best
+        optimality_pct = (opt_sum / sel_sum).item() if sel_sum > 0 else 0.0
+        del selected_cbs, opt_mse_layer
+
         _save_layer_result(
             layer_name,
             layer_codebook,
@@ -408,9 +432,10 @@ def _process_block_on_gpu(
             selected_indices,
             num_candidates,
             output_dir,
+            optimality_pct,
         )
 
-    del all_mse_full
+    del all_mse_full, all_optimal_mse
 
     block_elapsed = time.perf_counter() - block_start
     print(
@@ -473,6 +498,7 @@ def _aggregate_results(
     global_total_blocks = 0
     global_coverage_accum: dict[str, list[float]] = {}
     global_without_zero_pcts: list[float] = []
+    global_optimality_pcts: list[float] = []
 
     for layer_name in target_layers:
         sanitized = _sanitize_layer_name(layer_name)
@@ -485,6 +511,7 @@ def _aggregate_results(
 
         global_total_blocks += stats["num_blocks"]
         global_without_zero_pcts.append(stats["without_zero_pct"])
+        global_optimality_pcts.append(stats.get("optimality_pct", 0.0))
 
         for k_str, cov_val in stats["coverage_curve"].items():
             global_coverage_accum.setdefault(k_str, []).append(cov_val)
@@ -493,6 +520,7 @@ def _aggregate_results(
             "num_blocks": stats["num_blocks"],
             "num_codebooks": stats["num_codebooks"],
             "coverage_at_256": stats["coverage_at_256"],
+            "optimality_pct": stats.get("optimality_pct", 0.0),
             "with_zero_count": stats["with_zero_count"],
             "without_zero_count": stats["without_zero_count"],
             "top5": stats["top5"],
@@ -507,6 +535,11 @@ def _aggregate_results(
         if global_without_zero_pcts
         else 0.0
     )
+    avg_optimality_pct = (
+        round(sum(global_optimality_pcts) / len(global_optimality_pcts), 4)
+        if global_optimality_pcts
+        else 0.0
+    )
 
     summary = {
         "model": str(model_path),
@@ -519,6 +552,7 @@ def _aggregate_results(
         "layers": layer_stats,
         "global_stats": {
             "avg_coverage_at_256": global_avg_coverage.get("256", 0.0),
+            "avg_optimality_pct": avg_optimality_pct,
             "avg_without_zero_pct": avg_without_zero_pct,
             "coverage_curve": global_avg_coverage,
         },
@@ -535,6 +569,7 @@ def _aggregate_results(
     print(f"  Time: {elapsed:.1f}s")
     for k, v in global_avg_coverage.items():
         print(f"  Avg coverage top-{k}: {v * 100:.1f}%")
+    print(f"  Avg optimality: {avg_optimality_pct * 100:.1f}%")
     print(f"  Avg without-zero pct: {avg_without_zero_pct * 100:.1f}%")
     print(f"  Saved per-layer codebooks to {output_dir}/")
     print(f"  Saved summary to {summary_path}")
@@ -669,9 +704,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Per-layer data-driven codebook analysis with Hessian importance weighting."
     )
-    parser.add_argument(
-        "--model-path", type=str, default="/data/models/Qwen3-30B-A3B-NVFP4"
-    )
+    parser.add_argument("--model-path", type=str, default="/data/models/Qwen3-30B-A3B")
     parser.add_argument("--hessian-dir", type=str, default="/data/hessians")
     parser.add_argument("--output-dir", type=str, default="/data/codebooks")
     parser.add_argument("--mlp-only", action="store_true")
@@ -679,7 +712,7 @@ def main() -> None:
     parser.add_argument(
         "--selection-method",
         type=str,
-        default="greedy",
+        default="frequency",
         choices=["frequency", "greedy"],
     )
     parser.add_argument("--coverage-threshold", type=float, default=1.05)

@@ -11,7 +11,7 @@ def main():
     ]
     sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
 
-    llm = LLM(model="/data/models/Qwen3-30B-A3B-NVFP4", tensor_parallel_size=1)
+    llm = LLM(model="/data/models/Qwen3-30B-A3B", tensor_parallel_size=1, backend="trt")
 
     outputs = llm.generate(prompts, sampling_params)
 
@@ -23,5 +23,5 @@ def main():
 
 
 # The entry point of the program needs to be protected for spawning processes.
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

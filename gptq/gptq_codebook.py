@@ -8,7 +8,6 @@ from fakequant import CodebookQuantizer
 
 
 class CodebookGPTQ:
-
     def __init__(
         self,
         in_features: int,
@@ -36,8 +35,10 @@ class CodebookGPTQ:
 
         if self.H is None:
             self.H = torch.zeros(
-                self.in_features, self.in_features,
-                device=X.device, dtype=torch.float32,
+                self.in_features,
+                self.in_features,
+                device=X.device,
+                dtype=torch.float32,
             )
 
         beta = self.num_samples / (self.num_samples + batch_size)
@@ -48,9 +49,12 @@ class CodebookGPTQ:
         self.num_samples += batch_size
 
     @torch.no_grad()
-    def quantize(self, W: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        assert self.H is not None and self.num_samples > 0, \
+    def quantize(
+        self, W: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        assert self.H is not None and self.num_samples > 0, (
             "Must call update() with calibration data first"
+        )
 
         W = W.clone().float()
         out_features, in_features = W.shape
@@ -78,14 +82,14 @@ class CodebookGPTQ:
 
                 group_importance = None
                 if h_diag is not None:
-                    group_importance = h_diag[c1 + g:c1 + g_end].unsqueeze(0)
+                    group_importance = h_diag[c1 + g : c1 + g_end].unsqueeze(0)
 
                 q_phase1, s_opt, best_k = self.quantizer.fakequant_blocks_with_scale(
                     w_group.reshape(-1, 16),
                     return_codebook_idx=True,
                     importance_weights=group_importance,
                 )
-                all_fp4_phase1[:, c1 + g:c1 + g_end] = q_phase1.reshape_as(w_group)
+                all_fp4_phase1[:, c1 + g : c1 + g_end] = q_phase1.reshape_as(w_group)
                 s_opt = s_opt.reshape(out_features, 1)
                 cb_vals = codebook[best_k]
 
@@ -97,17 +101,19 @@ class CodebookGPTQ:
                     scaled_col = w_col / s_opt.squeeze(1)
                     dists = (scaled_col.unsqueeze(-1) - cb_vals).abs()
                     nearest_idx = dists.argmin(dim=-1)
-                    q_col = cb_vals[torch.arange(out_features, device=W.device), nearest_idx]
+                    q_col = cb_vals[
+                        torch.arange(out_features, device=W.device), nearest_idx
+                    ]
                     group_fp4[:, j] = q_col
 
                     w_q_col = q_col * s_opt.squeeze(1)
                     d = H_blk[col, col]
                     err = (w_blk[:, col] - w_q_col) / d
                     if col + 1 < c2 - c1:
-                        w_blk[:, col + 1:].addr_(err, H_blk[col, col + 1:], alpha=-1)
+                        w_blk[:, col + 1 :].addr_(err, H_blk[col, col + 1 :], alpha=-1)
                     errs[:, col] = err
 
-                all_fp4[:, c1 + g:c1 + g_end] = group_fp4
+                all_fp4[:, c1 + g : c1 + g_end] = group_fp4
                 all_scales[:, (c1 + g) // 16] = s_opt.reshape(out_features)
 
             if c2 < in_features:
@@ -134,6 +140,8 @@ class CodebookGPTQ:
             H_inv = torch.cholesky_inverse(torch.linalg.cholesky(H))
             H_inv_cho = torch.linalg.cholesky(H_inv, upper=True)
         except Exception:
-            H_inv_cho = torch.eye(self.in_features, device=H.device, dtype=torch.float32)
+            H_inv_cho = torch.eye(
+                self.in_features, device=H.device, dtype=torch.float32
+            )
 
         return H_inv_cho

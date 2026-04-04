@@ -17,10 +17,12 @@ DEFAULT_DATASET_NAME = "wikitext"
 DEFAULT_DATASET_CONFIG = "wikitext-2-raw-v1"
 MLP_SUFFIXES = (".mlp.gate_proj", ".mlp.up_proj", ".mlp.down_proj")
 EXPERT_MLP_PATTERN = ".mlp.experts."
-DEFAULT_CAL_BATCH_SIZE = 16
+DEFAULT_CAL_BATCH_SIZE = 128
 
 
-def tokenize_wikitext(tokenizer, num_samples: int = 128, seq_len: int = 2048) -> list[torch.Tensor]:
+def tokenize_wikitext(
+    tokenizer, num_samples: int = 128, seq_len: int = 2048
+) -> list[torch.Tensor]:
     dataset = load_dataset(DEFAULT_DATASET_NAME, DEFAULT_DATASET_CONFIG, split="train")
     text = "\n\n".join(dataset["text"])
     tokens = tokenizer(text, return_tensors="pt").input_ids[0]
@@ -39,7 +41,10 @@ def tokenize_wikitext(tokenizer, num_samples: int = 128, seq_len: int = 2048) ->
 
 
 def _is_mlp_layer(layer_name: str) -> bool:
-    return any(layer_name.endswith(suffix) for suffix in MLP_SUFFIXES) or EXPERT_MLP_PATTERN in layer_name
+    return (
+        any(layer_name.endswith(suffix) for suffix in MLP_SUFFIXES)
+        or EXPERT_MLP_PATTERN in layer_name
+    )
 
 
 def layer_block_index(layer_name: str) -> int | None:
@@ -69,11 +74,8 @@ def hessian_block_keys(output_dir: Path, block_idx: int) -> set[str]:
         return set(f.keys())
 
 
-def hessian_block_contains_layers(output_dir: Path, block_idx: int, layer_names: list[str]) -> bool:
-    if not layer_names:
-        return True
-    available_keys = hessian_block_keys(output_dir, block_idx)
-    return all(layer_name in available_keys for layer_name in layer_names)
+def hessian_block_complete(output_dir: Path, block_idx: int) -> bool:
+    return hessian_block_file(output_dir, block_idx).exists()
 
 
 def load_hessian(output_dir: Path, layer_name: str) -> torch.Tensor | None:
@@ -105,7 +107,11 @@ def collect_hessians(
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    torch_dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}[dtype]
+    torch_dtype = {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float32": torch.float32,
+    }[dtype]
 
     print(f"Loading tokenizer from {model_path}")
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -118,6 +124,12 @@ def collect_hessians(
         trust_remote_code=True,
     )
     model.eval()
+
+    # Neuter lm_head: we only need intermediate activations captured by hooks,
+    # not the (batch × seq × vocab_size) logits that OOM on gather-back-to-GPU-0.
+    # Model is deleted after calibration, so no restore needed.
+    with torch.no_grad():
+        model.lm_head.weight.data = model.lm_head.weight.data[:1]
 
     samples = tokenize_wikitext(tokenizer, num_samples=num_samples, seq_len=seq_len)
 
@@ -134,7 +146,9 @@ def collect_hessians(
 
     num_blocks = len(block_layers)
     total_layers = sum(len(layers) for layers in block_layers.values())
-    print(f"Hook candidates: {total_layers} linear layers across {num_blocks} transformer blocks")
+    print(
+        f"Hook candidates: {total_layers} linear layers across {num_blocks} transformer blocks"
+    )
     if mlp_only:
         print("Mode: MLP-only")
     if continue_existing:
@@ -148,7 +162,7 @@ def collect_hessians(
         layers_in_block = block_layers[block_idx]
         layer_names = [layer_name for layer_name, _ in layers_in_block]
 
-        if continue_existing and hessian_block_contains_layers(output_dir, block_idx, layer_names):
+        if continue_existing and hessian_block_complete(output_dir, block_idx):
             skipped_hessians += len(layer_names)
             print(f"  block {block_idx}/{num_blocks - 1}: already complete, skipping")
             continue
@@ -166,7 +180,9 @@ def collect_hessians(
                 d = x.shape[1]
 
                 if layer_name not in block_hessians:
-                    block_hessians[layer_name] = torch.zeros(d, d, dtype=torch.float32)
+                    block_hessians[layer_name] = torch.zeros(
+                        d, d, dtype=torch.float32, device=x.device
+                    )
                     block_counts[layer_name] = 0
 
                 sample_count = block_counts[layer_name]
@@ -174,16 +190,21 @@ def collect_hessians(
                 alpha = 2.0 / (sample_count + n)
                 x_scaled = x.mul(math.sqrt(alpha))
                 update = x_scaled.T @ x_scaled
-                block_hessians[layer_name].mul_(beta).add_(update.cpu())
+                block_hessians[layer_name].mul_(beta).add_(update)
                 block_counts[layer_name] = sample_count + n
 
             return hook_fn
 
-        hooks = [module.register_forward_hook(make_hook(layer_name)) for layer_name, module in layers_in_block]
+        hooks = [
+            module.register_forward_hook(make_hook(layer_name))
+            for layer_name, module in layers_in_block
+        ]
 
         if layers_in_block:
             for batch_start in range(0, len(samples), DEFAULT_CAL_BATCH_SIZE):
-                batch = torch.cat(samples[batch_start:batch_start + DEFAULT_CAL_BATCH_SIZE], dim=0).to(input_device)
+                batch = torch.cat(
+                    samples[batch_start : batch_start + DEFAULT_CAL_BATCH_SIZE], dim=0
+                ).to(input_device)
                 with torch.no_grad():
                     model(batch, use_cache=False)
                 del batch
@@ -216,21 +237,50 @@ def collect_hessians(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Collect per-layer Hessians for GPTQ calibration.")
-    parser.add_argument("--model-path", type=str, default=DEFAULT_MODEL_PATH,
-                        help=f"HuggingFace model path (default: {DEFAULT_MODEL_PATH})")
-    parser.add_argument("--output-dir", type=str, default="/data/hessians",
-                        help="Directory to save Hessian .pt files")
-    parser.add_argument("--num-samples", type=int, default=128,
-                        help="Number of calibration sequences (default: 128)")
-    parser.add_argument("--seq-len", type=int, default=2048,
-                        help="Sequence length per sample (default: 2048)")
-    parser.add_argument("--dtype", type=str, default="float16",
-                        choices=["float16", "bfloat16", "float32"])
-    parser.add_argument("--mlp-only", action="store_true",
-                        help="Collect Hessians only for MLP/expert linear layers")
-    parser.add_argument("--continue", dest="continue_existing", action="store_true",
-                        help="Skip layers whose calibration artifacts already exist")
+    parser = argparse.ArgumentParser(
+        description="Collect per-layer Hessians for GPTQ calibration."
+    )
+    parser.add_argument(
+        "--model-path",
+        type=str,
+        default=DEFAULT_MODEL_PATH,
+        help=f"HuggingFace model path (default: {DEFAULT_MODEL_PATH})",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="/data/hessians",
+        help="Directory to save Hessian .pt files",
+    )
+    parser.add_argument(
+        "--num-samples",
+        type=int,
+        default=128,
+        help="Number of calibration sequences (default: 128)",
+    )
+    parser.add_argument(
+        "--seq-len",
+        type=int,
+        default=2048,
+        help="Sequence length per sample (default: 2048)",
+    )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="float16",
+        choices=["float16", "bfloat16", "float32"],
+    )
+    parser.add_argument(
+        "--mlp-only",
+        action="store_true",
+        help="Collect Hessians only for MLP/expert linear layers",
+    )
+    parser.add_argument(
+        "--continue",
+        dest="continue_existing",
+        action="store_true",
+        help="Skip layers whose calibration artifacts already exist",
+    )
     args = parser.parse_args()
 
     collect_hessians(

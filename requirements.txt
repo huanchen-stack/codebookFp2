@@ -1,7 +1,9 @@
 torch
 nvidia-modelopt[torch]
+nvidia-modelopt[hf]
 transformers
 safetensors
+datasets
 huggingface_hub
 accelerate
 lm-eval

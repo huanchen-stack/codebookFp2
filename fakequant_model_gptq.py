@@ -28,7 +28,9 @@ from gptq import CodebookGPTQ
 from gptq.calibrate import hessian_block_keys, layer_block_index, load_hessian
 
 
-def _format_missing_layers(missing_layers: list[str], artifact_label: str, artifact_dir: Path) -> str:
+def _format_missing_layers(
+    missing_layers: list[str], artifact_label: str, artifact_dir: Path
+) -> str:
     preview = ", ".join(missing_layers[:3])
     suffix = "" if len(missing_layers) <= 3 else ", ..."
     return (
@@ -42,7 +44,9 @@ def _group_layers_by_block(target_layers: list[str]) -> dict[int, list[str]]:
     for layer_name in target_layers:
         block_idx = layer_block_index(layer_name)
         if block_idx is None:
-            raise ValueError(f"Target layer is not inside a transformer block: {layer_name}")
+            raise ValueError(
+                f"Target layer is not inside a transformer block: {layer_name}"
+            )
         layers_by_block.setdefault(block_idx, []).append(layer_name)
     return layers_by_block
 
@@ -54,12 +58,14 @@ def _validate_local_calibration_artifacts(
     missing_hessians: list[str] = []
     for block_idx, layer_names in _group_layers_by_block(target_layers).items():
         available_keys = hessian_block_keys(artifact_dir, block_idx)
-        missing_hessians.extend(layer_name for layer_name in layer_names if layer_name not in available_keys)
+        missing_hessians.extend(
+            layer_name for layer_name in layer_names if layer_name not in available_keys
+        )
 
     if missing_hessians:
-        raise FileNotFoundError(
-            _format_missing_layers(missing_hessians, "Hessian entries", artifact_dir)
-            + ". Run `python -m gptq.calibrate --output-dir ...` first."
+        print(
+            f"WARNING: {_format_missing_layers(missing_hessians, 'Hessian entries', artifact_dir)}"
+            + ". These layers will use the default codebook (no GPTQ)."
         )
 
 
@@ -114,7 +120,9 @@ def _process_block_on_gpu(
                     )
                 packed = packed_cpu.to(device=device)
                 scale = scale_cpu.to(device=device)
-                gscale_for_output = gscale_cpu.to(device=device, dtype=torch.float32).reshape(1)
+                gscale_for_output = gscale_cpu.to(
+                    device=device, dtype=torch.float32
+                ).reshape(1)
                 fp4_values = quantizer.unpack_uint8_to_fp4(packed)
                 _, in_features = fp4_values.shape
                 scale_expanded = scale.to(torch.float32).repeat_interleave(16, dim=1)
@@ -125,13 +133,14 @@ def _process_block_on_gpu(
 
             hessian = load_hessian(calibration_dir, base)
             if hessian is None:
-                raise FileNotFoundError(f"Missing Hessian for {base} in {calibration_dir}")
+                print(f"  [GPU {gpu_id}] SKIP (no Hessian, default codebook): {base}")
+                continue
             gptq.H = hessian.to(device)
             gptq.num_samples = 1
 
             print(f"  [GPU {gpu_id}] gptq({ref_mode})→{output_format} {base}")
 
-            fp4_out, scales_out, _ = gptq.quantize(w)
+            fp4_out, scales_out, _, _ = gptq.quantize(w)
 
             if output_format == "bf16":
                 dequantized = (fp4_out * scales_out).to(dtype=torch.bfloat16)
@@ -143,7 +152,9 @@ def _process_block_on_gpu(
                 new_packed = quantizer.pack_fp4_to_uint8(fp4_out)
                 new_weight_scale = quantizer._cast_scale_to_fp8(scales_out / gscale_val)
                 tensors[weight_name] = new_packed.to(device="cpu")
-                tensors[scale_name] = new_weight_scale.to(dtype=torch.float8_e4m3fn, device="cpu")
+                tensors[scale_name] = new_weight_scale.to(
+                    dtype=torch.float8_e4m3fn, device="cpu"
+                )
                 if input_format == "bf16":
                     tensors[f"{base}.weight_scale_2"] = gscale_val.to(device="cpu")
 
@@ -217,8 +228,7 @@ def _process_shards_gptq(
 
         tensors = load_file(str(input_shard), device="cpu")
         shard_targets = sorted(
-            b for b in target_layers
-            if _resolve_weight_name(b, weight_map) in tensors
+            b for b in target_layers if _resolve_weight_name(b, weight_map) in tensors
         )
 
         if not shard_targets:
@@ -226,7 +236,9 @@ def _process_shards_gptq(
                 save_file(tensors, str(output_shard))
             continue
 
-        print(f"[{shard_idx}/{len(shard_order)}] {shard_rel}  ({len(shard_targets)} target layers)")
+        print(
+            f"[{shard_idx}/{len(shard_order)}] {shard_rel}  ({len(shard_targets)} target layers)"
+        )
 
         for base in shard_targets:
             weight_name = _resolve_weight_name(base, weight_map)
@@ -238,11 +250,17 @@ def _process_shards_gptq(
                 t = tensors[weight_name]
                 block_idx = layer_block_index(base)
                 if block_idx is None:
-                    raise ValueError(f"Target layer is not inside a transformer block: {base}")
+                    raise ValueError(
+                        f"Target layer is not inside a transformer block: {base}"
+                    )
                 if block_idx not in block_key_cache:
-                    block_key_cache[block_idx] = hessian_block_keys(calibration_dir, block_idx)
+                    block_key_cache[block_idx] = hessian_block_keys(
+                        calibration_dir, block_idx
+                    )
                 h_status = "✓" if base in block_key_cache[block_idx] else "✗"
-                print(f"  [{idx}/{len(target_layers)}] {base}  shape={tuple(t.shape)}  hessian={h_status}")
+                print(
+                    f"  [{idx}/{len(target_layers)}] {base}  shape={tuple(t.shape)}  hessian={h_status}"
+                )
                 continue
 
             gscale_for_output = torch.tensor([1.0], device=device)
@@ -264,7 +282,9 @@ def _process_shards_gptq(
                     )
                 packed = packed_cpu.to(device=device)
                 scale = scale_cpu.to(device=device)
-                gscale_for_output = gscale_cpu.to(device=device, dtype=torch.float32).reshape(1)
+                gscale_for_output = gscale_cpu.to(
+                    device=device, dtype=torch.float32
+                ).reshape(1)
                 fp4_values = quantizer.unpack_uint8_to_fp4(packed)
                 _, in_features = fp4_values.shape
                 scale_expanded = scale.to(torch.float32).repeat_interleave(16, dim=1)
@@ -275,13 +295,17 @@ def _process_shards_gptq(
 
             hessian = load_hessian(calibration_dir, base)
             if hessian is None:
-                raise FileNotFoundError(f"Missing Hessian for {base} in {calibration_dir}")
+                raise FileNotFoundError(
+                    f"Missing Hessian for {base} in {calibration_dir}"
+                )
             gptq.H = hessian.to(device)
             gptq.num_samples = 1
 
-            print(f"  [{idx}/{len(target_layers)}] gptq({ref_mode})→{output_format} {base}")
+            print(
+                f"  [{idx}/{len(target_layers)}] gptq({ref_mode})→{output_format} {base}"
+            )
 
-            fp4_out, scales_out, _ = gptq.quantize(w)
+            fp4_out, scales_out, _, _ = gptq.quantize(w)
 
             if output_format == "bf16":
                 dequantized = (fp4_out * scales_out).to(dtype=torch.bfloat16)
@@ -293,7 +317,9 @@ def _process_shards_gptq(
                 new_packed = quantizer.pack_fp4_to_uint8(fp4_out)
                 new_weight_scale = quantizer._cast_scale_to_fp8(scales_out / gscale_val)
                 tensors[weight_name] = new_packed.to(device="cpu")
-                tensors[scale_name] = new_weight_scale.to(dtype=torch.float8_e4m3fn, device="cpu")
+                tensors[scale_name] = new_weight_scale.to(
+                    dtype=torch.float8_e4m3fn, device="cpu"
+                )
                 if input_format == "bf16":
                     tensors[f"{base}.weight_scale_2"] = gscale_val.to(device="cpu")
 
@@ -317,7 +343,9 @@ def run(
     num_gpus: int = 1,
 ) -> None:
     if not input_path.exists() or not input_path.is_dir():
-        raise FileNotFoundError(f"Input path does not exist or is not a directory: {input_path}")
+        raise FileNotFoundError(
+            f"Input path does not exist or is not a directory: {input_path}"
+        )
 
     weight_map = _load_index(input_path)
     input_format = detect_input_format(weight_map)
@@ -366,7 +394,9 @@ def run(
 
     layers_by_block = _group_layers_by_block(target_layers)
     sorted_blocks = sorted(layers_by_block.keys())
-    effective_gpus = min(num_gpus, len(sorted_blocks), max(1, torch.cuda.device_count()))
+    effective_gpus = min(
+        num_gpus, len(sorted_blocks), max(1, torch.cuda.device_count())
+    )
 
     print(f"\n{effective_gpus} GPU(s), {len(sorted_blocks)} blocks")
     gpu_assignments: list[list[int]] = [[] for _ in range(effective_gpus)]
@@ -375,7 +405,9 @@ def run(
 
     for gpu_id, blocks in enumerate(gpu_assignments):
         if blocks:
-            block_range = f"{blocks[0]}-{blocks[-1]}" if len(blocks) > 1 else str(blocks[0])
+            block_range = (
+                f"{blocks[0]}-{blocks[-1]}" if len(blocks) > 1 else str(blocks[0])
+            )
             print(f"  GPU {gpu_id}: blocks [{block_range}] ({len(blocks)} blocks)")
 
     ctx = mp.get_context("spawn")
@@ -403,7 +435,9 @@ def run(
     for p in processes:
         p.join()
         if p.exitcode != 0:
-            raise RuntimeError(f"GPU worker {p.name} failed with exit code {p.exitcode}")
+            raise RuntimeError(
+                f"GPU worker {p.name} failed with exit code {p.exitcode}"
+            )
 
     block_shard_files = set()
     for block_idx in sorted_blocks:
@@ -432,12 +466,25 @@ def main() -> None:
     parser.add_argument("--device", type=str, default=_default_device())
     parser.add_argument("--mlp-only", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--hessian-dir", type=str, required=True,
-                        help="Local calibration directory produced by `python -m gptq.calibrate --output-dir ...`")
-    parser.add_argument("--output-format", type=str, default=None, choices=["nvfp4", "bf16"],
-                        help="Output format (default: auto-detect from GPU or CBINT2_COMPUTE_CAP env)")
-    parser.add_argument("--num-gpus", type=int, default=1,
-                        help="Number of GPUs for parallel block processing (default: 1)")
+    parser.add_argument(
+        "--hessian-dir",
+        type=str,
+        required=True,
+        help="Local calibration directory produced by `python -m gptq.calibrate --output-dir ...`",
+    )
+    parser.add_argument(
+        "--output-format",
+        type=str,
+        default=None,
+        choices=["nvfp4", "bf16"],
+        help="Output format (default: auto-detect from GPU or CBINT2_COMPUTE_CAP env)",
+    )
+    parser.add_argument(
+        "--num-gpus",
+        type=int,
+        default=1,
+        help="Number of GPUs for parallel block processing (default: 1)",
+    )
     args = parser.parse_args()
 
     run(
